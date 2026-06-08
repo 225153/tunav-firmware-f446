@@ -59,8 +59,32 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #include <stdio.h>
+#include <string.h>
 
-
+void EC200U_SendAT(char* cmd) {
+    char log[100];
+    uint8_t buffer[256];
+    
+    // Log vers UART2
+    sprintf(log, "\r\n[SEND] %s", cmd);
+    HAL_UART_Transmit(&huart2, (uint8_t*)log, strlen(log), 100);
+    
+    // Envoi commande vers UART4 (EC200U)
+    HAL_UART_Transmit(&huart4, (uint8_t*)cmd, strlen(cmd), 100);
+    
+    // Attente et lecture de la réponse sur UART4
+    memset(buffer, 0, sizeof(buffer));
+    HAL_StatusTypeDef status = HAL_UART_Receive(&huart4, buffer, sizeof(buffer) - 1, 1000);
+    
+    if (status == HAL_OK || strlen((char*)buffer) > 0) {
+        // Renvoi de la réponse vers UART2
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[RECV] ", 9, 100);
+        HAL_UART_Transmit(&huart2, buffer, strlen((char*)buffer), 500);
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 100);
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[ERROR] No response from EC200U\r\n", 35, 100);
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -96,28 +120,26 @@ int main(void)
   MX_UART4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  
-  
-  
+  HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Testing EC200U...\r\n", 33, 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  char msg[50];
-  uint32_t count = 0;
-  
   while (1)
   {
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-    char msg1[] = "[STATUS] LED D4 is ON\r\n";
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg1, sizeof(msg1) - 1, HAL_MAX_DELAY);
-    HAL_Delay(1000); // Exactly 1 second delay at 8MHz!
+    // Toggle LED
+    HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
+    
+    // Commands to EC200U
+    EC200U_SendAT("AT\r\n");
+    HAL_Delay(2000);
+    
+    EC200U_SendAT("AT+CPIN?\r\n");
+    HAL_Delay(2000);
 
-    // 2. Turn LED D4 OFF and print state
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-    char msg2[] = "[STATUS] LED D4 is OFF\r\n";
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg2, sizeof(msg2) - 1, HAL_MAX_DELAY);
-    HAL_Delay(1000);
+    EC200U_SendAT("AT+CSQ\r\n");
+    HAL_Delay(5000);
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
