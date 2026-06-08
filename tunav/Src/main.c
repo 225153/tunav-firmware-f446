@@ -86,6 +86,54 @@ void EC200U_SendAT(char* cmd) {
     }
 }
 
+// Nouvelle fonction pour l'envoi TCP spécifique
+void EC200U_TCPSend(char* data) {
+    uint8_t buffer[128];
+    char log[100];
+
+    // 1. Ouvrir la connexion TCP
+    EC200U_SendAT("AT+QIOPEN=1,0,\"TCP\",\"41.226.24.13\",5000,0,0\r\n");
+    HAL_Delay(3000); // Attendre +QIOPEN
+
+    // 2. Préparer l'envoi
+    sprintf(log, "AT+QISEND=0,%d\r\n", (int)strlen(data));
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[SEND] ", 9, 100);
+    HAL_UART_Transmit(&huart2, (uint8_t*)log, strlen(log), 100);
+    HAL_UART_Transmit(&huart4, (uint8_t*)log, strlen(log), 100);
+    
+    // 3. Attendre le prompt ">" (boucle robuste)
+    uint32_t startTick = HAL_GetTick();
+    uint8_t promptFound = 0;
+    while (HAL_GetTick() - startTick < 3000) {
+        uint8_t ch;
+        if (HAL_UART_Receive(&huart4, &ch, 1, 100) == HAL_OK) {
+            if (ch == '>') {
+                promptFound = 1;
+                break;
+            }
+        }
+    }
+    
+    if (promptFound) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[TCP] Prompt > found! Sending payload...\r\n", 45, 100);
+        // 4. Envoyer "Hello" sans \r\n
+        HAL_UART_Transmit(&huart4, (uint8_t*)data, strlen(data), 500);
+        
+        // 5. Attendre SEND OK
+        HAL_Delay(2000);
+        memset(buffer, 0, sizeof(buffer));
+        HAL_UART_Receive(&huart4, buffer, sizeof(buffer)-1, 1000);
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[RECV] ", 9, 100);
+        HAL_UART_Transmit(&huart2, buffer, strlen((char*)buffer), 500);
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[ERROR] Prompt > NOT RECEIVED\r\n", 33, 100);
+    }
+
+    // 6. Fermer la connexion
+    HAL_Delay(1000);
+    EC200U_SendAT("AT+QICLOSE=0\r\n");
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -143,6 +191,26 @@ int main(void)
 
     EC200U_SendAT("AT+CGREG?\r\n");
     HAL_Delay(1000);
+
+    // Orange Tunisia GPRS Context Activation
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Activating Orange GPRS ---\r\n", 34, 100);
+    
+    // 1. Configure APN (weborange)
+    EC200U_SendAT("AT+QICSGP=1,1,\"weborange\",\"\",\"\",0\r\n");
+    HAL_Delay(1000);
+
+    // 2. Activate Context (can take time)
+    EC200U_SendAT("AT+QIACT=1\r\n");
+    HAL_Delay(4000); 
+
+    // 3. Query IP Address
+    EC200U_SendAT("AT+QIACT?\r\n");
+    HAL_Delay(2000);
+
+    // --- START TCP TRANSMISSION ---
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Starting TCP Send to Orange Server ---\r\n", 47, 100);
+    EC200U_TCPSend("Hello");
+    // --- END TCP TRANSMISSION ---
 
     EC200U_SendAT("AT+CSQ\r\n");
     HAL_Delay(5000);
