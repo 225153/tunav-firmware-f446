@@ -132,10 +132,17 @@ int main(void)
     
     // Commands to EC200U
     EC200U_SendAT("AT\r\n");
-    HAL_Delay(2000);
+    HAL_Delay(1000);
     
     EC200U_SendAT("AT+CPIN?\r\n");
-    HAL_Delay(2000);
+    HAL_Delay(1000);
+
+    // Network registration checks
+    EC200U_SendAT("AT+CREG?\r\n");
+    HAL_Delay(1000);
+
+    EC200U_SendAT("AT+CGREG?\r\n");
+    HAL_Delay(1000);
 
     EC200U_SendAT("AT+CSQ\r\n");
     HAL_Delay(5000);
