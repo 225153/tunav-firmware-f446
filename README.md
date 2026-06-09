@@ -1,95 +1,48 @@
-# Tunav Firmware - STM32F446RET6
+## 📡 Real-Time Telemetry via MQTT
 
-Ce projet est un firmware de base stabilisé pour une carte personnalisée (Custom PCB) basée sur le microcontrôleur **STM32F446RET6**. Il a été migré de STM32CubeIDE vers **PlatformIO** pour une meilleure gestion du développement sous VS Code.
+This branch contains the implementation for streaming live telemetry data using the **EC200U Cellular Module** over an unencrypted raw TCP socket, paired with a public WebSockets-based dashboard for live monitoring.
 
-## 🚀 Fonctionnalités actuelles
-- **Diagnostic LED** : Clignotement matériel pour vérifier que le MCU est vivant.
-- **Console Série** : Sortie de débogage pour surveiller l'état du système.
-- **Récupération Automatique** : Configuration OpenOCD optimisée pour éviter les verrouillages (lockout) du port SWD.
+### 🌐 Public Broker Details
+We utilize the free, public sandbox broker provided by HiveMQ. This setup **does not require a username or password**, making it ideal for rapid prototyping and testing.
 
-## 📌 Configuration Hardware
+* **Public Broker Host:** `broker.hivemq.com`
+* **Telemetry Topic:** `tunav/telemetry`
 
-### 1. LED de Diagnostic
-- **Broche** : `PC13`
-- **Comportement** : Clignote toutes les 500ms.
+---
 
-### 2. Moniteur Série (UART)
-- **Interface** : `USART2`
-- **Broches** : 
-  - `PA2` (TX)
-  - `PA3` (RX)
-- **Configuration** :
-  - Baudrate : `115200`
-  - Data bits : `8`
-  - Parity : `None`
-  - Stop bits : `1`
+### 🖥️ How to Set Up the Live Web Dashboard
 
-## 🛠 Installation & Utilisation
+To monitor the data packets streaming from the STM32 board in real time, follow these exact configurations on the public MQTT web client:
 
-1. Installez l'extension **PlatformIO IDE** dans VS Code.
-2. Clonez ce dépôt.
-3. Ouvrez le dossier racine dans VS Code.
-4. Pour compiler et téléverser :
-   - Cliquez sur la flèche `PlatformIO: Upload` en bas de VS Code.
-   - Si la carte est verrouillée, maintenez le bouton **RESET** physique, lancez l'upload, et relâchez le bouton dès que `Uploading` apparaît.
-5. Pour voir les messages :
-   - Cliquez sur l'icône de prise `PlatformIO: Serial Monitor`.
+1. Open the free online client in your web browser:  
+   👉 **[HiveMQ Web MQTT Client](https://www.hivemq.com/demos/websocket-client/)**
 
-### 3. Module Cellulaire (EC200U via UART4)
-- **Interface** : `UART4`
-- **Broches** :
-  - `PA0` (TX vers EC200U)
-  - `PA1` (RX depuis EC200U)
-- **Configuration** :
-  - Baudrate : `115200`
-  - Data bits : `8`
-  - Parity : `None`
-  - Stop bits : `1`
+2. Configure the **Connection** panel with the following parameters:
+   
+   | Field | Setting | Reason |
+   | :--- | :--- | :--- |
+   | **Host** | `broker.hivemq.com` | Public cluster broker endpoint |
+   | **Port** | `8884` | **Required** secure WebSocket port for browsers |
+   | **SSL** | **[X] Checked** | Web browsers (`https`) strictly block unencrypted sockets |
+   | **Clean Session** | **[X] Checked** | Wipes old lingering sessions instantly |
+   | **ClientID** | *Leave Default* | Automatically generates a unique browser identifier |
 
-## 📡 Commandes AT Supportées
+3. Click **Connect**. The status indicator dot will turn **Green** once established.
 
-Le firmware implémente une boucle de test avec les commandes AT suivantes pour valider la connectivité du modem **Quectel EC200U-EU** sur le réseau **Orange Tunisia** :
+4. Go to the **Subscriptions** panel on the right side:
+   * Click **Add New Topic Subscription**
+   * **Topic:** `tunav/telemetry`
+   * **QoS:** `0`
+   * Click **Subscribe**
 
-### Diagnostic Modem
-- `AT` - Vérifier la présence du modem
-- `AT+CPIN?` - Vérifier le statut de la carte SIM
-- `AT+CREG?` - Vérifier l'enregistrement sur le réseau 2G/3G/4G
-- `AT+CGREG?` - Vérifier l'enregistrement sur le réseau GPRS/LTE
+Incoming payloads from the hardware will stream into the **Messages** log panel instantly.
 
-### Activation GPRS (Orange)
-- `AT+QICSGP=1,1,"weborange","","",0` - Configurer le contexte de données avec l'APN Orange
-- `AT+QIACT=1` - Activer le contexte GPRS
-- `AT+QIACT?` - Vérifier l'activation et l'adresse IP obtenue
+---
 
-### Transmission TCP
-- `AT+QIOPEN=1,0,"TCP","41.226.24.13",5000,0,0` - Ouvrir une connexion TCP vers le serveur
-- `AT+QISEND=0,5` - Préparer l'envoi de 5 octets
-- `AT+QICLOSE=0` - Fermer la connexion TCP
+### 🔌 Microcontroller Configuration Reference (EC200U)
 
-### Qualité du Signal
-- `AT+CSQ` - Vérifier la puissance du signal (RSSI)
-
-## 🔧 Utilisation
-
-### Première Utilisation
-1. Connectez le **ST-Link V2** à la carte via les broches SWD (SWCLK, SWDIO, GND).
-2. Ouvrez le projet dans **VS Code** avec **PlatformIO IDE**.
-3. Compilez et téléversez le code :
-   ```bash
-   pio run --target upload
-   ```
-4. **⚠️ IMPORTANT** : Après le téléversement, appuyez sur le bouton **RESET** situé près du MCU. Ceci redémarrera le microcontrôleur et lancera le firmware.
-5. Ouvrez le **Moniteur Série** pour voir les journaux :
-   ```bash
-   pio run --target monitor
-   ```
-
-### Redémarrage du Firmware
-Appuyez sur le bouton **RESET** (à côté du connecteur ST-Link) pour relancer les tests AT à tout moment.
-
-## ⚙️ Détails Techniques
-- **Framework** : STM32Cube HAL
-- **Horloge** : HSI (Interne) à 16 MHz (Configuré pour la stabilité sur PCB personnalisé).
-- **Outil de Flash** : ST-Link V2 avec gestion du Reset matériel (`connect_assert_srst`).
-- **Modem** : Quectel EC200U-EU (Réseau cellulaire 4G/2G).
-- **Opérateur** : Orange Tunisia (APN : `weborange`).
+> ⚠️ **Important Architecture Note:** While the web browser must use port **`8884`** with **SSL enabled** due to modern browser security restrictions, the embedded EC200U cellular engine communicates over raw unencrypted TCP. 
+> 
+> Ensure your STM32 AT command sequence targets the raw port:
+> * **AT Command Port:** `1883`
+> * **AT Command SSL Profile:** Disabled (`AT+QMTCFG="ssl",0,0`)
