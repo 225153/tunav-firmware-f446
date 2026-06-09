@@ -44,7 +44,11 @@ UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+#define RX_BUF_SIZE 1024
+uint8_t rx_ring_buf[RX_BUF_SIZE];
+volatile uint16_t rx_head = 0;
+volatile uint16_t rx_tail = 0;
+uint8_t rx_tmp_byte; // Octet temporaire pour l'interruption
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,79 +65,119 @@ static void MX_USART2_UART_Init(void);
 #include <stdio.h>
 #include <string.h>
 
-void EC200U_SendAT(char* cmd) {
-    char log[100];
-    uint8_t buffer[256];
+#include <stdio.h>
+#include <string.h>
+
+void EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
+    char log[256];
+    char buffer[512]; // Large buffer local pour reconstruire la réponse
+    uint16_t idx = 0;
+    uint32_t start_time = HAL_GetTick();
     
-    // Log vers UART2
-    sprintf(log, "\r\n[SEND] %s", cmd);
+    memset(buffer, 0, sizeof(buffer));
+    
+    // Nettoyage préventif des erreurs matérielles UART4
+    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) {
+        __HAL_UART_CLEAR_OREFLAG(&huart4);
+    }
+    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_NE)) {
+        __HAL_UART_CLEAR_NEFLAG(&huart4);
+    }
+
+    // Affichage Log PC
+    snprintf(log, sizeof(log), "\r\n[SEND] %s", cmd);
     HAL_UART_Transmit(&huart2, (uint8_t*)log, strlen(log), 100);
     
-    // Envoi commande vers UART4 (EC200U)
+    // Envoi au modem (Pendant ce temps, l'interruption capture l'écho sans perte !)
     HAL_UART_Transmit(&huart4, (uint8_t*)cmd, strlen(cmd), 100);
     
-    // Attente et lecture de la réponse sur UART4
-    memset(buffer, 0, sizeof(buffer));
-    HAL_StatusTypeDef status = HAL_UART_Receive(&huart4, buffer, sizeof(buffer) - 1, 1000);
+    // Boucle de lecture asynchrone du Ring Buffer
+    while ((HAL_GetTick() - start_time) < timeout_ms) {
+        
+        // Vider le ring buffer vers notre buffer local de traitement
+        while (rx_tail != rx_head) {
+            uint8_t ch = rx_ring_buf[rx_tail];
+            rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+            
+            if (idx < sizeof(buffer) - 1) {
+                buffer[idx++] = ch;
+                buffer[idx] = '\0'; // Garder la chaîne valide pour strstr
+            }
+        }
+        
+        // --- Analyse des conditions d'arrêt ---
+        if (strstr(cmd, "AT+QMTOPEN") != NULL) {
+            if (strstr(buffer, "+QMTOPEN:") != NULL && strchr(strstr(buffer, "+QMTOPEN:"), '\n') != NULL) {
+                break; // URC reçu et complet
+            }
+            if (strstr(buffer, "ERROR\r\n") != NULL) break;
+        }
+        else if (strstr(cmd, "AT+QMTCONN") != NULL) {
+            if (strstr(buffer, "+QMTCONN:") != NULL && strchr(strstr(buffer, "+QMTCONN:"), '\n') != NULL) {
+                break; // URC reçu et complet
+            }
+            if (strstr(buffer, "ERROR\r\n") != NULL) break;
+        }
+        else {
+            if (strstr(buffer, "OK\r\n") != NULL || strstr(buffer, "ERROR\r\n") != NULL) {
+                break;
+            }
+        }
+        
+        HAL_Delay(1); // Laisse le temps aux octets d'arriver dans le Ring Buffer
+    }
     
-    if (status == HAL_OK || strlen((char*)buffer) > 0) {
-        // Renvoi de la réponse vers UART2
+    // Affichage du résultat propre sur le PC
+    if (idx > 0) {
         HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[RECV] ", 9, 100);
-        HAL_UART_Transmit(&huart2, buffer, strlen((char*)buffer), 500);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buffer, idx, 500);
         HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 100);
     } else {
         HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[ERROR] No response from EC200U\r\n", 35, 100);
     }
 }
 
-// Nouvelle fonction pour l'envoi TCP spécifique
-void EC200U_TCPSend(char* data) {
-    uint8_t buffer[128];
-    char log[100];
+void EC200U_MQTTSend(char* payload) {
+    char mqtt_cmd[300];
 
-    // 1. Ouvrir la connexion TCP
-    EC200U_SendAT("AT+QIOPEN=1,0,\"TCP\",\"41.226.24.13\",5000,0,0\r\n");
-    HAL_Delay(3000); // Attendre +QIOPEN
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Sending Simple Unencrypted MQTT ---\r\n", 43, 100);
 
-    // 2. Préparer l'envoi
-    sprintf(log, "AT+QISEND=0,%d\r\n", (int)strlen(data));
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[SEND] ", 9, 100);
-    HAL_UART_Transmit(&huart2, (uint8_t*)log, strlen(log), 100);
-    HAL_UART_Transmit(&huart4, (uint8_t*)log, strlen(log), 100);
-    
-    // 3. Attendre le prompt ">" (boucle robuste)
-    uint32_t startTick = HAL_GetTick();
-    uint8_t promptFound = 0;
-    while (HAL_GetTick() - startTick < 3000) {
-        uint8_t ch;
-        if (HAL_UART_Receive(&huart4, &ch, 1, 100) == HAL_OK) {
-            if (ch == '>') {
-                promptFound = 1;
-                break;
-            }
-        }
-    }
-    
-    if (promptFound) {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[TCP] Prompt > found! Sending payload...\r\n", 45, 100);
-        // 4. Envoyer "Hello" sans \r\n
-        HAL_UART_Transmit(&huart4, (uint8_t*)data, strlen(data), 500);
-        
-        // 5. Attendre SEND OK
-        HAL_Delay(2000);
-        memset(buffer, 0, sizeof(buffer));
-        HAL_UART_Receive(&huart4, buffer, sizeof(buffer)-1, 1000);
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[RECV] ", 9, 100);
-        HAL_UART_Transmit(&huart2, buffer, strlen((char*)buffer), 500);
-    } else {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[ERROR] Prompt > NOT RECEIVED\r\n", 33, 100);
-    }
+    // 1. Force close any stuck previous sessions
+    EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1500);
+    HAL_Delay(200);
 
-    // 6. Fermer la connexion
-    HAL_Delay(1000);
-    EC200U_SendAT("AT+QICLOSE=0\r\n");
+    // 2. Set MQTT Protocol version to v3.1.1 (Required by HiveMQ)
+    EC200U_SendAT("AT+QMTCFG=\"version\",0,4\r\n", 1000);
+    HAL_Delay(150);
+
+    // 3. Force Clean Session = 1 (Tells HiveMQ to clear old failed attempts immediately)
+    EC200U_SendAT("AT+QMTCFG=\"session\",0,1\r\n", 1000);
+    HAL_Delay(150);
+
+    // 4. Configure Keepalive timeout to 60 seconds
+    EC200U_SendAT("AT+QMTCFG=\"keepalive\",0,60\r\n", 1000);
+    HAL_Delay(150);
+
+    // 5. Keep SSL disabled on the microcontroller side (Uses raw TCP)
+    EC200U_SendAT("AT+QMTCFG=\"ssl\",0,0\r\n", 1000);
+    HAL_Delay(200);
+
+    // 6. Open connection to HiveMQ using port 1883 
+    EC200U_SendAT("AT+QMTOPEN=0,\"broker.hivemq.com\",1883\r\n", 6000);
+    HAL_Delay(500);
+
+    // 7. Connect with a completely UNIQUE Client ID string (No spaces!)
+    EC200U_SendAT("AT+QMTCONN=0,\"TUNAV_STM32_Board_8831\"\r\n", 6000);
+    HAL_Delay(500);
+
+    // 8. Publish your message payload to the shared topic
+    snprintf(mqtt_cmd, sizeof(mqtt_cmd), "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"%s\"\r\n", payload);
+    EC200U_SendAT(mqtt_cmd, 4000);
+    HAL_Delay(200);
+
+    // 9. Disconnect gracefully
+    EC200U_SendAT("AT+QMTDISC=0\r\n", 1500);
 }
-
 /* USER CODE END 0 */
 
 /**
@@ -168,7 +212,11 @@ int main(void)
   MX_UART4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Testing EC200U...\r\n", 33, 100);
+ HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Testing EC200U...\r\n", 33, 100);
+  
+  // TOUT PREMIER ÉLÉMENT : Lancer l'écoute par interruption sur 1 octet
+  HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -178,43 +226,33 @@ int main(void)
     // Toggle LED
     HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
     
-    // Commands to EC200U
-    EC200U_SendAT("AT\r\n");
-    HAL_Delay(1000);
-    
-    EC200U_SendAT("AT+CPIN?\r\n");
-    HAL_Delay(1000);
+    // Verification de base du modem (500ms d'attente suffisent amplement ici)
+    EC200U_SendAT("AT\r\n", 500);
+    EC200U_SendAT("AT+CPIN?\r\n", 500);
 
-    // Network registration checks
-    EC200U_SendAT("AT+CREG?\r\n");
-    HAL_Delay(1000);
+    // Verifications réseau cellulaire
+    EC200U_SendAT("AT+CREG?\r\n", 500);
+    EC200U_SendAT("AT+CGREG?\r\n", 500);
 
-    EC200U_SendAT("AT+CGREG?\r\n");
-    HAL_Delay(1000);
-
-    // Orange Tunisia GPRS Context Activation
+    // Activation du contexte GPRS Orange Tunisie
     HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Activating Orange GPRS ---\r\n", 34, 100);
     
-    // 1. Configure APN (weborange)
-    EC200U_SendAT("AT+QICSGP=1,1,\"weborange\",\"\",\"\",0\r\n");
-    HAL_Delay(1000);
+    // Configuration APN et activation du contexte (Temps adapté pour la recherche réseau)
+    EC200U_SendAT("AT+QICSGP=1,1,\"weborange\",\"\",\"\",0\r\n", 1000);
+    EC200U_SendAT("AT+QIACT=1\r\n", 4000); 
+    EC200U_SendAT("AT+QIACT?\r\n", 1000);
 
-    // 2. Activate Context (can take time)
-    EC200U_SendAT("AT+QIACT=1\r\n");
-    HAL_Delay(4000); 
-
-    // 3. Query IP Address
-    EC200U_SendAT("AT+QIACT?\r\n");
-    HAL_Delay(2000);
-
-    // --- START TCP TRANSMISSION ---
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Starting TCP Send to Orange Server ---\r\n", 47, 100);
-    EC200U_TCPSend("Hello");
-    // --- END TCP TRANSMISSION ---
-
-    EC200U_SendAT("AT+CSQ\r\n");
-    HAL_Delay(5000);
+    // --- DEBUT TRANSMISSION MQTT ---
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Starting MQTT Send via Method B ---\r\n", 44, 100);
     
+    EC200U_MQTTSend("Hello from TUNAV Board!");
+    
+    // --- FIN TRANSMISSION MQTT ---
+
+    EC200U_SendAT("AT+CSQ\r\n", 1000);
+    
+    // Pause de 5 secondes avant de relancer un cycle complet de test
+    HAL_Delay(5000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -362,6 +400,21 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == UART4) {
+        // Calculer la prochaine position de la tête du tampon circulaire
+        uint16_t next_head = (rx_head + 1) % RX_BUF_SIZE;
+        
+        if (next_head != rx_tail) { // Sécurité anti-débordement
+            rx_ring_buf[rx_head] = rx_tmp_byte;
+            rx_head = next_head;
+        }
+        
+        // Relancer immédiatement l'interruption pour le prochain octet
+        HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
+    }
+}
 
 /* USER CODE END 4 */
 
