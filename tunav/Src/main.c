@@ -18,10 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "FreeRTOS.h"
+#include "queue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,12 +45,35 @@
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
 
+/* Definitions for TaskLed */
+osThreadId_t TaskLedHandle;
+const osThreadAttr_t TaskLed_attributes = {
+  .name = "TaskLed",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for TaskMqtt */
+osThreadId_t TaskMqttHandle;
+const osThreadAttr_t TaskMqtt_attributes = {
+  .name = "TaskMqtt",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for Tasklog */
+osThreadId_t TasklogHandle;
+const osThreadAttr_t Tasklog_attributes = {
+  .name = "Tasklog",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
-#define RX_BUF_SIZE 1024
+#define RX_BUF_SIZE 1024  // <-- Double-check that this line is at the very top of PV!
 uint8_t rx_ring_buf[RX_BUF_SIZE];
 volatile uint16_t rx_head = 0;
 volatile uint16_t rx_tail = 0;
 uint8_t rx_tmp_byte; // Octet temporaire pour l'interruption
+
+QueueHandle_t LogQueueHandle = NULL;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,6 +81,10 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
+void StartDefaultTask(void *argument);
+void StartTask02(void *argument);
+void StartTask03(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -65,118 +94,70 @@ static void MX_USART2_UART_Init(void);
 #include <stdio.h>
 #include <string.h>
 
-#include <stdio.h>
-#include <string.h>
+void Log_String(const char* str) {
+    char msg_buffer[128]; 
+    strncpy(msg_buffer, str, sizeof(msg_buffer) - 1);
+    msg_buffer[sizeof(msg_buffer) - 1] = '\0';
+    
+    if (LogQueueHandle != NULL) {
+        xQueueSend(LogQueueHandle, msg_buffer, 0);
+    }
+}
 
-void EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
-    char log[256];
-    char buffer[512]; // Large buffer local pour reconstruire la réponse
+// Changed return type from void to uint8_t (1 = Success/OK, 0 = Failure/Timeout)
+uint8_t EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
+    char log[128];
+    char buffer[512]; 
     uint16_t idx = 0;
     uint32_t start_time = HAL_GetTick();
+    uint8_t status = 0; // Default to failed
     
     memset(buffer, 0, sizeof(buffer));
     
-    // Nettoyage préventif des erreurs matérielles UART4
-    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) {
-        __HAL_UART_CLEAR_OREFLAG(&huart4);
-    }
-    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_NE)) {
-        __HAL_UART_CLEAR_NEFLAG(&huart4);
-    }
+    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) __HAL_UART_CLEAR_OREFLAG(&huart4);
+    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_NE))  __HAL_UART_CLEAR_NEFLAG(&huart4);
 
-    // Affichage Log PC
-    snprintf(log, sizeof(log), "\r\n[SEND] %s", cmd);
-    HAL_UART_Transmit(&huart2, (uint8_t*)log, strlen(log), 100);
+    snprintf(log, sizeof(log), "[SEND] %s", cmd);
+    Log_String(log);
     
-    // Envoi au modem (Pendant ce temps, l'interruption capture l'écho sans perte !)
     HAL_UART_Transmit(&huart4, (uint8_t*)cmd, strlen(cmd), 100);
     
-    // Boucle de lecture asynchrone du Ring Buffer
     while ((HAL_GetTick() - start_time) < timeout_ms) {
-        
-        // Vider le ring buffer vers notre buffer local de traitement
         while (rx_tail != rx_head) {
             uint8_t ch = rx_ring_buf[rx_tail];
             rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
             
             if (idx < sizeof(buffer) - 1) {
                 buffer[idx++] = ch;
-                buffer[idx] = '\0'; // Garder la chaîne valide pour strstr
+                buffer[idx] = '\0'; 
             }
         }
         
-        // --- Analyse des conditions d'arrêt ---
         if (strstr(cmd, "AT+QMTOPEN") != NULL) {
-            if (strstr(buffer, "+QMTOPEN:") != NULL && strchr(strstr(buffer, "+QMTOPEN:"), '\n') != NULL) {
-                break; // URC reçu et complet
-            }
-            if (strstr(buffer, "ERROR\r\n") != NULL) break;
+            if (strstr(buffer, "+QMTOPEN: 0,0") != NULL) { status = 1; break; } // Success URC
+            if (strstr(buffer, "ERROR\r\n") != NULL || strchr(strstr(buffer, "+QMTOPEN: 0,"), '\n') != NULL) { status = 0; break; }
         }
         else if (strstr(cmd, "AT+QMTCONN") != NULL) {
-            if (strstr(buffer, "+QMTCONN:") != NULL && strchr(strstr(buffer, "+QMTCONN:"), '\n') != NULL) {
-                break; // URC reçu et complet
-            }
-            if (strstr(buffer, "ERROR\r\n") != NULL) break;
+            if (strstr(buffer, "+QMTCONN: 0,0,0") != NULL) { status = 1; break; } // Success URC
+            if (strstr(buffer, "ERROR\r\n") != NULL) { status = 0; break; }
         }
         else {
-            if (strstr(buffer, "OK\r\n") != NULL || strstr(buffer, "ERROR\r\n") != NULL) {
-                break;
-            }
+            if (strstr(buffer, "OK\r\n") != NULL) { status = 1; break; }
+            if (strstr(buffer, "ERROR\r\n") != NULL) { status = 0; break; }
         }
         
-        HAL_Delay(1); // Laisse le temps aux octets d'arriver dans le Ring Buffer
+        osDelay(1); 
     }
     
-    // Affichage du résultat propre sur le PC
     if (idx > 0) {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[RECV] ", 9, 100);
-        HAL_UART_Transmit(&huart2, (uint8_t*)buffer, idx, 500);
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 100);
+        Log_String("[RECV] ");
+        Log_String(buffer);
+        Log_String("\r\n");
     } else {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n[ERROR] No response from EC200U\r\n", 35, 100);
+        Log_String("[ERROR] No response from EC200U\r\n");
     }
-}
-
-void EC200U_MQTTSend(char* payload) {
-    char mqtt_cmd[300];
-
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Sending Simple Unencrypted MQTT ---\r\n", 43, 100);
-
-    // 1. Force close any stuck previous sessions
-    EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1500);
-    HAL_Delay(200);
-
-    // 2. Set MQTT Protocol version to v3.1.1 (Required by HiveMQ)
-    EC200U_SendAT("AT+QMTCFG=\"version\",0,4\r\n", 1000);
-    HAL_Delay(150);
-
-    // 3. Force Clean Session = 1 (Tells HiveMQ to clear old failed attempts immediately)
-    EC200U_SendAT("AT+QMTCFG=\"session\",0,1\r\n", 1000);
-    HAL_Delay(150);
-
-    // 4. Configure Keepalive timeout to 60 seconds
-    EC200U_SendAT("AT+QMTCFG=\"keepalive\",0,60\r\n", 1000);
-    HAL_Delay(150);
-
-    // 5. Keep SSL disabled on the microcontroller side (Uses raw TCP)
-    EC200U_SendAT("AT+QMTCFG=\"ssl\",0,0\r\n", 1000);
-    HAL_Delay(200);
-
-    // 6. Open connection to HiveMQ using port 1883 
-    EC200U_SendAT("AT+QMTOPEN=0,\"broker.hivemq.com\",1883\r\n", 6000);
-    HAL_Delay(500);
-
-    // 7. Connect with a completely UNIQUE Client ID string (No spaces!)
-    EC200U_SendAT("AT+QMTCONN=0,\"TUNAV_STM32_Board_8831\"\r\n", 6000);
-    HAL_Delay(500);
-
-    // 8. Publish your message payload to the shared topic
-    snprintf(mqtt_cmd, sizeof(mqtt_cmd), "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"%s\"\r\n", payload);
-    EC200U_SendAT(mqtt_cmd, 4000);
-    HAL_Delay(200);
-
-    // 9. Disconnect gracefully
-    EC200U_SendAT("AT+QMTDISC=0\r\n", 1500);
+    
+    return status;
 }
 /* USER CODE END 0 */
 
@@ -212,47 +193,61 @@ int main(void)
   MX_UART4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
- HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Testing EC200U...\r\n", 33, 100);
+   HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Booting RTOS...\r\n", 31, 100);
+   HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
   
-  // TOUT PREMIER ÉLÉMENT : Lancer l'écoute par interruption sur 1 octet
-  HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
+  // Create Message Queue for 10 entries of 128 bytes length strings
+  LogQueueHandle = xQueueCreate(10, 128);
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of TaskLed */
+  TaskLedHandle = osThreadNew(StartDefaultTask, NULL, &TaskLed_attributes);
+
+  /* creation of TaskMqtt */
+  TaskMqttHandle = osThreadNew(StartTask02, NULL, &TaskMqtt_attributes);
+
+  /* creation of Tasklog */
+  TasklogHandle = osThreadNew(StartTask03, NULL, &Tasklog_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // Toggle LED
-    HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
     
-    // Verification de base du modem (500ms d'attente suffisent amplement ici)
-    EC200U_SendAT("AT\r\n", 500);
-    EC200U_SendAT("AT+CPIN?\r\n", 500);
-
-    // Verifications réseau cellulaire
-    EC200U_SendAT("AT+CREG?\r\n", 500);
-    EC200U_SendAT("AT+CGREG?\r\n", 500);
-
-    // Activation du contexte GPRS Orange Tunisie
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Activating Orange GPRS ---\r\n", 34, 100);
-    
-    // Configuration APN et activation du contexte (Temps adapté pour la recherche réseau)
-    EC200U_SendAT("AT+QICSGP=1,1,\"weborange\",\"\",\"\",0\r\n", 1000);
-    EC200U_SendAT("AT+QIACT=1\r\n", 4000); 
-    EC200U_SendAT("AT+QIACT?\r\n", 1000);
-
-    // --- DEBUT TRANSMISSION MQTT ---
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- Starting MQTT Send via Method B ---\r\n", 44, 100);
-    
-    EC200U_MQTTSend("Hello from TUNAV Board!");
-    
-    // --- FIN TRANSMISSION MQTT ---
-
-    EC200U_SendAT("AT+CSQ\r\n", 1000);
-    
-    // Pause de 5 secondes avant de relancer un cycle complet de test
-    HAL_Delay(5000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -417,6 +412,132 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 }
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the TaskLed thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
+    osDelay(500);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTask02 */
+/**
+* @brief Function implementing the TaskMqtt thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask02 */
+void StartTask02(void *argument)
+{
+  /* USER CODE BEGIN StartTask02 */
+  char payload_cmd[256];
+  unsigned long msg_counter = 0; // Changed to unsigned long to match %lu perfectly without warnings
+  uint8_t link_is_up = 0;
+
+  /* Infinite loop */
+  for(;;)
+  {
+    // If our connection link is down, run the configuration state machine
+    if (!link_is_up) {
+        Log_String("\r\n--- [NET] Connection lost/down. Initializing Network... ---\r\n");
+        
+        EC200U_SendAT("AT\r\n", 500);
+        EC200U_SendAT("AT+CPIN?\r\n", 500);
+        EC200U_SendAT("AT+QICSGP=1,1,\"internet.tn\",\"\",\"\",0\r\n", 1000);
+        EC200U_SendAT("AT+QIACT=1\r\n", 4000);
+        
+        Log_String("\r\n--- [MQTT] Connecting to Broker... ---\r\n");
+        EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1000);
+        EC200U_SendAT("AT+QMTCFG=\"version\",0,4\r\n", 1000);
+        EC200U_SendAT("AT+QMTCFG=\"session\",0,1\r\n", 1000);
+        
+        if (EC200U_SendAT("AT+QMTOPEN=0,\"broker.hivemq.com\",1883\r\n", 5000)) {
+            if (EC200U_SendAT("AT+QMTCONN=0,\"TUNAV_STM32_RTOS_8831\"\r\n", 5000)) {
+                Log_String("\r\n--- [STATUS] Connected & Ready! ---\r\n");
+                link_is_up = 1; // Handshake successful!
+            }
+        }
+        
+        if (!link_is_up) {
+            Log_String("\r\n--- [RETRY] Setup failed. Retrying cycle in 5s... ---\r\n");
+            osDelay(5000);
+            continue; // Jump to next iteration to try again
+        }
+    }
+
+    // Link is active: Formulate and stream payload
+    snprintf(payload_cmd, sizeof(payload_cmd), 
+             "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"Hello from RTOS Thread! Msg #%lu\"\r\n", 
+             msg_counter);
+                 
+    // If the publish command returns a failure/error, mark link as down!
+    if (EC200U_SendAT(payload_cmd, 3000)) {
+        msg_counter++; // Only increment counter if broker acknowledged transmission
+    } else {
+        Log_String("\r\n--- [WARN] Publish failed. Resetting session link... ---\r\n");
+        link_is_up = 0; 
+    }
+        
+    osDelay(5000);
+  }
+  /* USER CODE END StartTask02 */
+}
+
+/* USER CODE BEGIN Header_StartTask03 */
+/**
+* @brief Function implementing the Tasklog thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask03 */
+void StartTask03(void *argument)
+{
+  /* USER CODE BEGIN StartTask03 */
+  char received_msg[128];
+  /* Infinite loop */
+  for(;;)
+  {
+    // Use portMAX_DELAY for native FreeRTOS queues
+    if (xQueueReceive(LogQueueHandle, received_msg, portMAX_DELAY) == pdTRUE) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)received_msg, strlen(received_msg), 200);
+    }
+  }
+  /* USER CODE END StartTask03 */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM1 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM1)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
