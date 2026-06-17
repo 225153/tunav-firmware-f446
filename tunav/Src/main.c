@@ -66,6 +66,23 @@ const osThreadAttr_t Tasklog_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for TaskPriorityMqt */
+osThreadId_t TaskPriorityMqtHandle;
+const osThreadAttr_t TaskPriorityMqt_attributes = {
+  .name = "TaskPriorityMqt",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for MqttCommandQueue */
+osMessageQueueId_t MqttCommandQueueHandle;
+const osMessageQueueAttr_t MqttCommandQueue_attributes = {
+  .name = "MqttCommandQueue"
+};
+/* Definitions for GsmMutex */
+osMutexId_t GsmMutexHandle;
+const osMutexAttr_t GsmMutex_attributes = {
+  .name = "GsmMutex"
+};
 /* USER CODE BEGIN PV */
 #define RX_BUF_SIZE 1024  // <-- Double-check that this line is at the very top of PV!
 uint8_t rx_ring_buf[RX_BUF_SIZE];
@@ -84,6 +101,7 @@ static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
 void StartTask02(void *argument);
 void StartTask03(void *argument);
+void StartTask04(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -104,14 +122,20 @@ void Log_String(const char* str) {
     }
 }
 
-// Changed return type from void to uint8_t (1 = Success/OK, 0 = Failure/Timeout)
+// Protected by GsmMutex!
 uint8_t EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
     char log[128];
     char buffer[512]; 
     uint16_t idx = 0;
-    uint32_t start_time = HAL_GetTick();
-    uint8_t status = 0; // Default to failed
+    uint32_t start_time;
+    uint8_t status = 0;
     
+    // 1. TRAP PROTECTION: Wait for the Mutex before doing anything
+    if (osMutexAcquire(GsmMutexHandle, osWaitForever) != osOK) {
+        return 0; // Failed to get lock
+    }
+
+    start_time = HAL_GetTick();
     memset(buffer, 0, sizeof(buffer));
     
     if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) __HAL_UART_CLEAR_OREFLAG(&huart4);
@@ -134,11 +158,11 @@ uint8_t EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
         }
         
         if (strstr(cmd, "AT+QMTOPEN") != NULL) {
-            if (strstr(buffer, "+QMTOPEN: 0,0") != NULL) { status = 1; break; } // Success URC
-            if (strstr(buffer, "ERROR\r\n") != NULL || strchr(strstr(buffer, "+QMTOPEN: 0,"), '\n') != NULL) { status = 0; break; }
+            if (strstr(buffer, "+QMTOPEN: 0,0") != NULL || strstr(buffer, "+QMTOPEN: 1,0") != NULL) { status = 1; break; }
+            if (strstr(buffer, "ERROR\r\n") != NULL) { status = 0; break; }
         }
         else if (strstr(cmd, "AT+QMTCONN") != NULL) {
-            if (strstr(buffer, "+QMTCONN: 0,0,0") != NULL) { status = 1; break; } // Success URC
+            if (strstr(buffer, "+QMTCONN: 0,0,0") != NULL || strstr(buffer, "+QMTCONN: 1,0,0") != NULL) { status = 1; break; }
             if (strstr(buffer, "ERROR\r\n") != NULL) { status = 0; break; }
         }
         else {
@@ -156,6 +180,9 @@ uint8_t EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
     } else {
         Log_String("[ERROR] No response from EC200U\r\n");
     }
+    
+    // 2. TRAP PROTECTION: Release the Mutex so other tasks can use the GSM
+    osMutexRelease(GsmMutexHandle);
     
     return status;
 }
@@ -203,6 +230,9 @@ int main(void)
 
   /* Init scheduler */
   osKernelInitialize();
+  /* Create the mutex(es) */
+  /* creation of GsmMutex */
+  GsmMutexHandle = osMutexNew(&GsmMutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -215,6 +245,10 @@ int main(void)
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of MqttCommandQueue */
+  MqttCommandQueueHandle = osMessageQueueNew (4, 128, &MqttCommandQueue_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -229,6 +263,9 @@ int main(void)
 
   /* creation of Tasklog */
   TasklogHandle = osThreadNew(StartTask03, NULL, &Tasklog_attributes);
+
+  /* creation of TaskPriorityMqt */
+  TaskPriorityMqtHandle = osThreadNew(StartTask04, NULL, &TaskPriorityMqt_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -515,6 +552,84 @@ void StartTask03(void *argument)
     }
   }
   /* USER CODE END StartTask03 */
+}
+
+/* USER CODE BEGIN Header_StartTask04 */
+/**
+* @brief Function implementing the TaskPriorityMqt thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask04 */
+void StartTask04(void *argument)
+{
+  /* USER CODE BEGIN StartTask04 */
+ uint8_t link_1_is_up = 0;
+  char priority_buffer[128];
+  uint16_t p_idx = 0;
+
+  // Wait 15 seconds at boot to allow Task02 to configure the network internet.tn
+  osDelay(15000); 
+
+  /* Infinite loop */
+  for(;;)
+  {
+    // 1. Establish Link 1 for Subscriptions
+    if (!link_1_is_up) {
+        Log_String("\r\n--- [HIGH PRIORITY] Starting Link 1 for Subscription... ---\r\n");
+        EC200U_SendAT("AT+QMTCLOSE=1\r\n", 1000);
+        
+        if (EC200U_SendAT("AT+QMTOPEN=1,\"broker.hivemq.com\",1883\r\n", 5000)) {
+            if (EC200U_SendAT("AT+QMTCONN=1,\"TUNAV_SUB_CLIENT_99\"\r\n", 5000)) {
+                if (EC200U_SendAT("AT+QMTSUB=1,1,\"tunav/commands\",1\r\n", 3000)) {
+                    Log_String("--- [HIGH PRIORITY] Successfully Subscribed! ---\r\n");
+                    link_1_is_up = 1;
+                }
+            }
+        }
+        
+        if (!link_1_is_up) {
+            osDelay(5000); // Retry later if failed
+            continue;
+        }
+    }
+
+    // 2. High-Speed Ring Buffer Parsing
+    // We only wait 5 ticks for the Mutex. If Task02 is sending telemetry, 
+    // we just skip this cycle and try again in 5ms.
+    if (osMutexAcquire(GsmMutexHandle, 5) == osOK) {
+        while (rx_tail != rx_head) {
+            uint8_t ch = rx_ring_buf[rx_tail];
+            rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+
+            if (p_idx < sizeof(priority_buffer) - 1) {
+                priority_buffer[p_idx++] = ch;
+                priority_buffer[p_idx] = '\0';
+            }
+
+            // End of line detected
+            if (ch == '\n') {
+                // Did HiveMQ send us data?
+                if (strstr(priority_buffer, "+QMTRECV:") != NULL) {
+                    Log_String("\r\n[URGENT] MQTT Command Received:\r\n");
+                    Log_String(priority_buffer);
+                    
+                    // Send to the command queue for processing
+                    osMessageQueuePut(MqttCommandQueueHandle, priority_buffer, 0, 0);
+                }
+                
+                // Clear the line buffer for the next incoming text
+                p_idx = 0; 
+                memset(priority_buffer, 0, sizeof(priority_buffer));
+            }
+        }
+        osMutexRelease(GsmMutexHandle);
+    }
+
+    // Yield back to Task02 (Telemetry) and TaskLed so they aren't starved
+    osDelay(5); 
+  }
+  /* USER CODE END StartTask04 */
 }
 
 /**
