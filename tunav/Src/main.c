@@ -595,8 +595,6 @@ void StartTask04(void *argument)
     }
 
     // 2. High-Speed Ring Buffer Parsing
-    // We only wait 5 ticks for the Mutex. If Task02 is sending telemetry, 
-    // we just skip this cycle and try again in 5ms.
     if (osMutexAcquire(GsmMutexHandle, 5) == osOK) {
         while (rx_tail != rx_head) {
             uint8_t ch = rx_ring_buf[rx_tail];
@@ -613,6 +611,20 @@ void StartTask04(void *argument)
                 if (strstr(priority_buffer, "+QMTRECV:") != NULL) {
                     Log_String("\r\n[URGENT] MQTT Command Received:\r\n");
                     Log_String(priority_buffer);
+                    
+                    // --- AJOUT : DETECTION DE LA COMMANDE RESET ---
+                    if (strstr(priority_buffer, "reset") != NULL || strstr(priority_buffer, "RESET") != NULL) {
+                        Log_String("\r\n[SYSTEM] Commande RESET reçue ! Redémarrage du STM32...\r\n");
+                        
+                        // On relâche proprement le Mutex avant le grand saut
+                        osMutexRelease(GsmMutexHandle);
+                        
+                        // On attend 500ms pour laisser Task03 (Tasklog) écrire sur l'UART2
+                        osDelay(500); 
+                        
+                        // Commande CMSIS magique pour rebooter le processeur
+                        NVIC_SystemReset(); 
+                    }
                     
                     // Send to the command queue for processing
                     osMessageQueuePut(MqttCommandQueueHandle, priority_buffer, 0, 0);
