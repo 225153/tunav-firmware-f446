@@ -83,7 +83,7 @@ Cette tâche gère la liaison de publication MQTT. Son rôle est le suivant :
 - configurer le contexte de données avec l'APN `internet.tn` ;
 - activer le contexte réseau ;
 - ouvrir une session MQTT sur HivemqBroker:https://www.hivemq.com/demos/websocket-client/ ;
--choose broker.hivemq.com and port 1883
+-choose broker.hivemq.com and port 1883 or 8884(default one)
 - publier toutes les 5 secondes un message de télémétrie sur le topic `tunav/telemetry`.
 
 Si la publication échoue, la tâche considère la liaison comme perdue et recommence la séquence d'initialisation.
