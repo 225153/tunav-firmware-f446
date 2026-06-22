@@ -43,6 +43,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* Definitions for TaskLed */
@@ -73,6 +74,13 @@ const osThreadAttr_t TaskPriorityMqt_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
+/* Definitions for TaskVigi */
+osThreadId_t TaskVigiHandle;
+const osThreadAttr_t TaskVigi_attributes = {
+  .name = "TaskVigi",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* Definitions for MqttCommandQueue */
 osMessageQueueId_t MqttCommandQueueHandle;
 const osMessageQueueAttr_t MqttCommandQueue_attributes = {
@@ -84,13 +92,34 @@ const osMutexAttr_t GsmMutex_attributes = {
   .name = "GsmMutex"
 };
 /* USER CODE BEGIN PV */
-#define RX_BUF_SIZE 1024  // <-- Double-check that this line is at the very top of PV!
+#define RX_BUF_SIZE 1024
 uint8_t rx_ring_buf[RX_BUF_SIZE];
 volatile uint16_t rx_head = 0;
 volatile uint16_t rx_tail = 0;
-uint8_t rx_tmp_byte; // Octet temporaire pour l'interruption
+uint8_t rx_tmp_byte; // Octet temporaire pour l'interruption du GSM
 
 QueueHandle_t LogQueueHandle = NULL;
+
+// --- AJOUTS POUR LE MODULE VIGI ---
+// Note : 'huart1' est déjà déclaré par CubeMX, pas besoin de le remettre ici !
+
+uint8_t TxData2[8] = {0x01, 0x03, 0x00, 0x0D, 0x00, 0x02, 0x55, 0xC8};
+uint8_t TxData3[8] = {0x01, 0x03, 0x00, 0x9E, 0x00, 0x03, 0x64, 0x25};
+uint8_t TxData[8]; // Sera calculé dynamiquement dans le main avec le CRC
+
+uint8_t RxDataVigi[200];     // Buffer de réception brut pour l'USART1
+char buffer_conv[200];       // Conversion Hex en String
+char buffer_conv2[200];
+char buffer_conv3[200];
+char savedResponseBuffer[601];
+
+// Identifiants requis pour ta trame finale VIGI
+char IMEI[16] = "864714063616289";
+char HEADER[20] = "*VIG";
+char footer[] = "#";
+
+// Augmenté à 750 pour accueillir en toute sécurité la trame complète sans déborder
+char shared_vigi_payload[750] = "Pas de donnees VIGI";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,10 +127,12 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
 void StartDefaultTask(void *argument);
 void StartTask02(void *argument);
 void StartTask03(void *argument);
 void StartTask04(void *argument);
+void StartTask05(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -112,13 +143,19 @@ void StartTask04(void *argument);
 #include <stdio.h>
 #include <string.h>
 
+void BytesToHexString(uint8_t *src, char *dst, uint16_t len) {
+    for (uint16_t i = 0; i < len; i++) {
+        sprintf(&dst[i * 2], "%02X", src[i]);
+    }
+}
+
 void Log_String(const char* str) {
     char msg_buffer[128]; 
     strncpy(msg_buffer, str, sizeof(msg_buffer) - 1);
     msg_buffer[sizeof(msg_buffer) - 1] = '\0';
     
     if (LogQueueHandle != NULL) {
-        xQueueSend(LogQueueHandle, msg_buffer, 0);
+        xQueueSend(LogQueueHandle, msg_buffer, portMAX_DELAY);
     }
 }
 
@@ -219,6 +256,7 @@ int main(void)
   MX_GPIO_Init();
   MX_UART4_Init();
   MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
    HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Booting RTOS...\r\n", 31, 100);
    HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
@@ -266,6 +304,9 @@ int main(void)
 
   /* creation of TaskPriorityMqt */
   TaskPriorityMqtHandle = osThreadNew(StartTask04, NULL, &TaskPriorityMqt_attributes);
+
+  /* creation of TaskVigi */
+  TaskVigiHandle = osThreadNew(StartTask05, NULL, &TaskVigi_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -363,6 +404,39 @@ static void MX_UART4_Init(void)
   /* USER CODE BEGIN UART4_Init 2 */
 
   /* USER CODE END UART4_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -642,6 +716,67 @@ void StartTask04(void *argument)
     osDelay(5); 
   }
   /* USER CODE END StartTask04 */
+}
+
+/* USER CODE BEGIN Header_StartTask05 */
+/**
+* @brief Function implementing the TaskVigi thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask05 */
+void StartTask05(void *argument)
+{
+  /* USER CODE BEGIN StartTask05 */
+  static char local_response[750];
+  Log_String("[VIGI] Tâche démarrée, requêtes prêtes.\r\n");
+
+  /* Infinite loop */
+  for(;;)
+  {
+    // --- ÉTAPE 1 : Envoyer TxData2 (Attente de 9 octets en retour) ---
+    memset(RxDataVigi, 0, sizeof(RxDataVigi));
+    HAL_UART_Transmit(&huart1, TxData2, 8, 100);
+    
+    // Le module répond en général instantanément (<20ms). Un timeout de 150ms est safe.
+    if (HAL_UART_Receive(&huart1, RxDataVigi, 9, 150) == HAL_OK) {
+        BytesToHexString(RxDataVigi, buffer_conv2, 9);
+    } else {
+        strcpy(buffer_conv2, "ERR_TIMEOUT_D2");
+    }
+
+    osDelay(50); // Petit temps de pause imposé par le protocole Modbus RTU
+
+    // --- ÉTAPE 2 : Envoyer TxData3 (Attente de 11 octets en retour) ---
+    memset(RxDataVigi, 0, sizeof(RxDataVigi));
+    HAL_UART_Transmit(&huart1, TxData3, 8, 100);
+    
+    if (HAL_UART_Receive(&huart1, RxDataVigi, 11, 150) == HAL_OK) {
+        BytesToHexString(RxDataVigi, buffer_conv3, 11);
+    } else {
+        strcpy(buffer_conv3, "ERR_TIMEOUT_D3");
+    }
+
+    // --- ÉTAPE 3 : Construction de la trame finale de télémétrie ---
+    // Format généré : *VIG&IMEI=864714063616289&D2=010304XXXX&D3=010306XXXX#
+    snprintf(local_response, sizeof(local_response), 
+             "%s&IMEI=%s&D2=%s&D3=%s%s", 
+             HEADER, IMEI, buffer_conv2, buffer_conv3, footer);
+
+    // --- ÉTAPE 4 : Copie sécurisée (atomique) dans le buffer partagé ---
+    // Comme TaskMqtt et TaskVigi ont la même priorité, on coupe temporairement l'ordonnanceur 
+    // le temps du strcpy pour éviter qu'une tâche lise un buffer à moitié écrit.
+    vTaskSuspendAll();
+    strncpy(shared_vigi_payload, local_response, sizeof(shared_vigi_payload) - 1);
+    shared_vigi_payload[sizeof(shared_vigi_payload) - 1] = '\0';
+    xTaskResumeAll();
+
+    Log_String(local_response);
+
+    // Attendre 10 secondes avant la prochaine lecture
+    osDelay(10000);
+  }
+  /* USER CODE END StartTask05 */
 }
 
 /**
