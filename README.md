@@ -78,10 +78,11 @@ Cette tâche fait clignoter la LED `PC13` toutes les 500 ms. Elle sert de témoi
 
 Cette tâche gère la liaison de publication MQTT. Son rôle est le suivant :
 
+
 - vérifier et préparer la connectivité du modem ;
 - configurer le contexte de données avec l'APN `internet.tn` ;
 - activer le contexte réseau ;
-- ouvrir une session MQTT sur `broker.hivemq.com:1883` ;
+- ouvrir une session MQTT sur HivemqBroker:https://www.hivemq.com/demos/websocket-client/ ;
 - publier toutes les 5 secondes un message de télémétrie sur le topic `tunav/telemetry`.
 
 Si la publication échoue, la tâche considère la liaison comme perdue et recommence la séquence d'initialisation.
