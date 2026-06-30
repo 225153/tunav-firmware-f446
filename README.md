@@ -82,8 +82,7 @@ Cette tâche gère la liaison de publication MQTT. Son rôle est le suivant :
 - vérifier et préparer la connectivité du modem ;
 - configurer le contexte de données avec l'APN `internet.tn` ;
 - activer le contexte réseau ;
-- ouvrir une session MQTT sur HivemqBroker:https://www.hivemq.com/demos/websocket-client/ ;
--choose broker.hivemq.com and port 1883
+- ouvrir une session MQTT sur **EMQX Cloud** ;
 - publier toutes les 5 secondes un message de télémétrie sur le topic `tunav/telemetry`.
 
 Si la publication échoue, la tâche considère la liaison comme perdue et recommence la séquence d'initialisation.
@@ -154,8 +153,8 @@ Si la carte ne répond pas du premier coup, gardez le bouton **RESET** appuyé p
 ### Paramètres modem
 
 - APN : `internet.tn`
-- Port MQTT : `1883`
-- Broker : `broker.hivemq.com`
+- Port MQTT : `8883` (MQTTS)
+- Broker : `jfaa7c61.ala.eu-central-1.emqxsl.com`
 
 ### Topics MQTT
 
@@ -185,3 +184,70 @@ Le firmware utilise principalement les commandes AT suivantes :
 ## Résumé fonctionnel
 
 En pratique, ce firmware sert de base de communication entre la carte STM32, un modem cellulaire et un broker MQTT. Il vérifie que le microcontrôleur démarre correctement, publie de la télémétrie périodique et accepte des commandes distantes. La procédure d'exploitation la plus importante est simple : **après chaque téléversement, appuyez sur RESET pour démarrer le programme**.
+
+## EMQX Cloud Broker Setup
+
+This section describes the configuration of the backend MQTT broker instance hosted on EMQX Cloud.
+
+### Deployment & Host Information
+- **Provider:** EMQX Cloud (Serverless Tier)
+- **Region:** `eu-central-1` (Frankfurt)
+- **Broker Host:** `jfaa7c61.ala.eu-central-1.emqxsl.com`
+
+### Dashboard Configuration Steps
+
+1.  **Authentication & Users:**
+    - Navigate to **Access Control** -> **Authentication**.
+    - Ensure a user exists with **Username:** `Tunav` and **Password:** `chebli`.
+    - *Note: These credentials are used by both the STM32 firmware and the MQTTX testing environment.*
+
+2.  **Network Ports:**
+    - The deployment automatically exposes two secure endpoints:
+        - **Port 8883 (MQTTS):** TCP with TLS, used by the STM32 EC200U cellular engine.
+        - **Port 8084 (WSS):** WebSockets with TLS, used by MQTTX Web and other browser tools.
+
+3.  **Topic Management:**
+    - EMQX initializes topics **on-demand**.
+    - You **do not** need to manually create or register `tunav/telemetry` or `tunav/commands` in the dashboard. They are created automatically when a client first publishes or subscribes to them.
+
+## Cloud Testing Setup
+
+This guide provides a step-by-step procedure for testing the firmware's MQTT functionality using the **MQTTX Web Client**.
+
+### Important Requirements
+- **Protocol Difference:** Since testing is done from a web browser, you **must** use the **Secure WebSocket (wss://)** protocol on port **8084**. Note that the STM32 firmware itself uses native **MQTTS** on port **8883**.
+- **Unique Client ID:** Ensure your browser's Client ID is unique (e.g., `MQTTX_WEB_BROWSER_VAL`). Using the same ID as another device or the STM32 will cause connection conflicts and kick devices offline.
+
+### Configuration Parameters
+Use these exact settings in your MQTTX Web Connection:
+
+| Parameter | Value |
+| :--- | :--- |
+| **Name** | EMQX Cloud Test |
+| **Protocol** | `wss://` |
+| **Host** | `jfaa7c61.ala.eu-central-1.emqxsl.com` |
+| **Port** | `8084` |
+| **Client ID** | `MQTTX_WEB_BROWSER_VAL` |
+| **Path** | `/mqtt` |
+| **Username** | `Tunav` |
+| **Password** | `chebli` |
+| **SSL/TLS** | **ON** (Enabled) |
+| **SSL Secure** | **OFF** (Disabled - allows testing without CA certificate uploads) |
+**link** : https://mqttx.app/web-client
+
+### Interacting with the Firmware
+
+#### 1. Monitoring Telemetry (Subscribing)
+To view live data coming from the STM32 hardware:
+- Add a new subscription.
+- **Topic:** `tunav/telemetry`
+- **QoS:** `0`
+- **Result:** You should see telemetry messages arriving every **5 seconds**.
+
+#### 2. Remote Commands (Publishing)
+To trigger actions on the hardware remotely:
+- **Topic:** `tunav/commands`
+- **QoS:** `0`
+- **Payload Type:** Plain Text
+- **Payload Content:** `reset`
+- **Result:** Sending this will trigger the `NVIC_SystemReset()` routine on the STM32, handled by our high-priority FreeRTOS ring-buffer task.

@@ -33,6 +33,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define EMQX_BROKER_HOST "jfaa7c61.ala.eu-central-1.emqxsl.com" // Paste your Connection Address here
+#define EMQX_BROKER_PORT "8883"             // EMQX Serverless TLS Port
+#define EMQX_USERNAME    "Tunav"        // The MQTT username you created
+#define EMQX_PASSWORD    "chebli"        // The MQTT password you created
 
 /* USER CODE END PD */
 
@@ -480,55 +484,69 @@ void StartTask02(void *argument)
 {
   /* USER CODE BEGIN StartTask02 */
   char payload_cmd[256];
-  unsigned long msg_counter = 0; // Changed to unsigned long to match %lu perfectly without warnings
-  uint8_t link_is_up = 0;
+unsigned long msg_counter = 0; 
+uint8_t link_is_up = 0;
 
-  /* Infinite loop */
-  for(;;)
-  {
-    // If our connection link is down, run the configuration state machine
-    if (!link_is_up) {
-        Log_String("\r\n--- [NET] Connection lost/down. Initializing Network... ---\r\n");
-        
-        EC200U_SendAT("AT\r\n", 500);
-        EC200U_SendAT("AT+CPIN?\r\n", 500);
-        EC200U_SendAT("AT+QICSGP=1,1,\"internet.tn\",\"\",\"\",0\r\n", 1000);
-        EC200U_SendAT("AT+QIACT=1\r\n", 4000);
-        
-        Log_String("\r\n--- [MQTT] Connecting to Broker... ---\r\n");
-        EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1000);
-        EC200U_SendAT("AT+QMTCFG=\"version\",0,4\r\n", 1000);
-        EC200U_SendAT("AT+QMTCFG=\"session\",0,1\r\n", 1000);
-        
-        if (EC200U_SendAT("AT+QMTOPEN=0,\"broker.hivemq.com\",1883\r\n", 5000)) {
-            if (EC200U_SendAT("AT+QMTCONN=0,\"TUNAV_STM32_RTOS_8831\"\r\n", 5000)) {
-                Log_String("\r\n--- [STATUS] Connected & Ready! ---\r\n");
-                link_is_up = 1; // Handshake successful!
-            }
-        }
-        
-        if (!link_is_up) {
-            Log_String("\r\n--- [RETRY] Setup failed. Retrying cycle in 5s... ---\r\n");
-            osDelay(5000);
-            continue; // Jump to next iteration to try again
-        }
-    }
-
-    // Link is active: Formulate and stream payload
-    snprintf(payload_cmd, sizeof(payload_cmd), 
-             "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"Hello from RTOS Thread! Msg #%lu\"\r\n", 
-             msg_counter);
-                 
-    // If the publish command returns a failure/error, mark link as down!
-    if (EC200U_SendAT(payload_cmd, 3000)) {
-        msg_counter++; // Only increment counter if broker acknowledged transmission
-    } else {
-        Log_String("\r\n--- [WARN] Publish failed. Resetting session link... ---\r\n");
-        link_is_up = 0; 
-    }
-        
-    osDelay(5000);
+/* Infinite loop */
+for(;;)
+{
+  if (!link_is_up) {
+      Log_String("\r\n--- [NET] Connection lost/down. Initializing Network... ---\r\n");
+      
+      EC200U_SendAT("AT\r\n", 500);
+      EC200U_SendAT("AT+CPIN?\r\n", 500);
+      EC200U_SendAT("AT+QICSGP=1,1,\"internet.tn\",\"\",\"\",0\r\n", 1000);
+      EC200U_SendAT("AT+QIACT=1\r\n", 4000);
+      
+      Log_String("\r\n--- [MQTT] Configuring Secure TLS Context for EMQX... ---\r\n");
+      EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1000);
+      EC200U_SendAT("AT+QMTCFG=\"version\",0,4\r\n", 1000);
+      EC200U_SendAT("AT+QMTCFG=\"session\",0,1\r\n", 1000);
+      
+      // Bind Link 0 to use internal SSL Context 0
+      EC200U_SendAT("AT+QMTCFG=\"ssl\",0,1,0\r\n", 1000);
+      
+      // Configure SSL Context 0 profile settings
+      EC200U_SendAT("AT+QSSLCFG=\"sslversion\",0,4\r\n", 1000);   // Force TLS 1.2
+      EC200U_SendAT("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF\r\n", 1000); // Allow all cipher suites
+      EC200U_SendAT("AT+QSSLCFG=\"sni\",0,1\r\n", 1000);          // MANDATORY: Enable SNI routing
+      EC200U_SendAT("AT+QSSLCFG=\"seclevel\",0,0\r\n", 1000);     // 0 = TLS Encryption without CA file validation
+      
+      Log_String("\r\n--- [MQTT] Opening Secure Connection Endpoint... ---\r\n");
+      char open_cmd[128];
+      snprintf(open_cmd, sizeof(open_cmd), "AT+QMTOPEN=0,\"" EMQX_BROKER_HOST "\"," EMQX_BROKER_PORT "\r\n");
+      
+      if (EC200U_SendAT(open_cmd, 6000)) {
+          char conn_cmd[192];
+          snprintf(conn_cmd, sizeof(conn_cmd), "AT+QMTCONN=0,\"TUNAV_STM32_RTOS_8831\",\"" EMQX_USERNAME "\",\"" EMQX_PASSWORD "\"\r\n");
+          
+          if (EC200U_SendAT(conn_cmd, 6000)) {
+              Log_String("\r\n--- [STATUS] Connected & Authenticated via EMQX TLS! ---\r\n");
+              link_is_up = 1; 
+          }
+      }
+      
+      if (!link_is_up) {
+          Log_String("\r\n--- [RETRY] Setup failed. Retrying cycle in 5s... ---\r\n");
+          osDelay(5000);
+          continue; 
+      }
   }
+
+  // Link is active: Formulate and stream payload
+  snprintf(payload_cmd, sizeof(payload_cmd), 
+           "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"Hello from RTOS Thread! Msg #%lu\"\r\n", 
+           msg_counter);
+               
+  if (EC200U_SendAT(payload_cmd, 3000)) {
+      msg_counter++; 
+  } else {
+      Log_String("\r\n--- [WARN] Publish failed. Resetting session link... ---\r\n");
+      link_is_up = 0; 
+  }
+      
+  osDelay(5000);
+}
   /* USER CODE END StartTask02 */
 }
 
@@ -565,82 +583,86 @@ void StartTask04(void *argument)
 {
   /* USER CODE BEGIN StartTask04 */
  uint8_t link_1_is_up = 0;
-  char priority_buffer[128];
-  uint16_t p_idx = 0;
+char priority_buffer[128];
+uint16_t p_idx = 0;
 
-  // Wait 15 seconds at boot to allow Task02 to configure the network internet.tn
-  osDelay(15000); 
+// Wait 15 seconds at boot to allow Task02 to configure the network internet.tn
+osDelay(15000); 
 
-  /* Infinite loop */
-  for(;;)
-  {
-    // 1. Establish Link 1 for Subscriptions
-    if (!link_1_is_up) {
-        Log_String("\r\n--- [HIGH PRIORITY] Starting Link 1 for Subscription... ---\r\n");
-        EC200U_SendAT("AT+QMTCLOSE=1\r\n", 1000);
-        
-        if (EC200U_SendAT("AT+QMTOPEN=1,\"broker.hivemq.com\",1883\r\n", 5000)) {
-            if (EC200U_SendAT("AT+QMTCONN=1,\"TUNAV_SUB_CLIENT_99\"\r\n", 5000)) {
-                if (EC200U_SendAT("AT+QMTSUB=1,1,\"tunav/commands\",1\r\n", 3000)) {
-                    Log_String("--- [HIGH PRIORITY] Successfully Subscribed! ---\r\n");
-                    link_1_is_up = 1;
-                }
-            }
-        }
-        
-        if (!link_1_is_up) {
-            osDelay(5000); // Retry later if failed
-            continue;
-        }
-    }
-
-    // 2. High-Speed Ring Buffer Parsing
-    if (osMutexAcquire(GsmMutexHandle, 5) == osOK) {
-        while (rx_tail != rx_head) {
-            uint8_t ch = rx_ring_buf[rx_tail];
-            rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
-
-            if (p_idx < sizeof(priority_buffer) - 1) {
-                priority_buffer[p_idx++] = ch;
-                priority_buffer[p_idx] = '\0';
-            }
-
-            // End of line detected
-            if (ch == '\n') {
-                // Did HiveMQ send us data?
-                if (strstr(priority_buffer, "+QMTRECV:") != NULL) {
-                    Log_String("\r\n[URGENT] MQTT Command Received:\r\n");
-                    Log_String(priority_buffer);
-                    
-                    // --- AJOUT : DETECTION DE LA COMMANDE RESET ---
-                    if (strstr(priority_buffer, "reset") != NULL || strstr(priority_buffer, "RESET") != NULL) {
-                        Log_String("\r\n[SYSTEM] Commande RESET reçue ! Redémarrage du STM32...\r\n");
-                        
-                        // On relâche proprement le Mutex avant le grand saut
-                        osMutexRelease(GsmMutexHandle);
-                        
-                        // On attend 500ms pour laisser Task03 (Tasklog) écrire sur l'UART2
-                        osDelay(500); 
-                        
-                        // Commande CMSIS magique pour rebooter le processeur
-                        NVIC_SystemReset(); 
-                    }
-                    
-                    // Send to the command queue for processing
-                    osMessageQueuePut(MqttCommandQueueHandle, priority_buffer, 0, 0);
-                }
-                
-                // Clear the line buffer for the next incoming text
-                p_idx = 0; 
-                memset(priority_buffer, 0, sizeof(priority_buffer));
-            }
-        }
-        osMutexRelease(GsmMutexHandle);
-    }
-
-    // Yield back to Task02 (Telemetry) and TaskLed so they aren't starved
-    osDelay(5); 
+/* Infinite loop */
+for(;;)
+{
+  // 1. Establish Link 1 for Subscriptions
+  if (!link_1_is_up) {
+      Log_String("\r\n--- [HIGH PRIORITY] Starting Link 1 TLS Connection... ---\r\n");
+      EC200U_SendAT("AT+QMTCLOSE=1\r\n", 1000);
+      
+      // Bind Link 1 to use internal SSL Context 1
+      EC200U_SendAT("AT+QMTCFG=\"ssl\",1,1,1\r\n", 1000);
+      
+      // Configure SSL Context 1 profile settings
+      EC200U_SendAT("AT+QSSLCFG=\"sslversion\",1,4\r\n", 1000);
+      EC200U_SendAT("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF\r\n", 1000);
+      EC200U_SendAT("AT+QSSLCFG=\"sni\",1,1\r\n", 1000);          // Mandatory SNI configuration
+      EC200U_SendAT("AT+QSSLCFG=\"seclevel\",1,0\r\n", 1000);     // TLS session configuration
+      
+      char open_cmd[128];
+      snprintf(open_cmd, sizeof(open_cmd), "AT+QMTOPEN=1,\"" EMQX_BROKER_HOST "\"," EMQX_BROKER_PORT "\r\n");
+      
+      if (EC200U_SendAT(open_cmd, 6000)) {
+          char conn_cmd[192];
+          snprintf(conn_cmd, sizeof(conn_cmd), "AT+QMTCONN=1,\"TUNAV_SUB_CLIENT_99\",\"" EMQX_USERNAME "\",\"" EMQX_PASSWORD "\"\r\n");
+          
+          if (EC200U_SendAT(conn_cmd, 6000)) {
+              if (EC200U_SendAT("AT+QMTSUB=1,1,\"tunav/commands\",1\r\n", 3000)) {
+                  Log_String("--- [HIGH PRIORITY] Successfully Subscribed via EMQX TLS! ---\r\n");
+                  link_1_is_up = 1;
+              }
+          }
+      }
+      
+      if (!link_1_is_up) {
+          osDelay(5000); // Retry later if failed
+          continue;
+      }
   }
+
+  // 2. High-Speed Ring Buffer Parsing
+  if (osMutexAcquire(GsmMutexHandle, 5) == osOK) {
+      while (rx_tail != rx_head) {
+          uint8_t ch = rx_ring_buf[rx_tail];
+          rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+
+          if (p_idx < sizeof(priority_buffer) - 1) {
+              priority_buffer[p_idx++] = ch;
+              priority_buffer[p_idx] = '\0';
+          }
+
+          // End of line detected
+          if (ch == '\n') {
+              if (strstr(priority_buffer, "+QMTRECV:") != NULL) {
+                  Log_String("\r\n[URGENT] MQTT Command Received:\r\n");
+                  Log_String(priority_buffer);
+                  
+                  if (strstr(priority_buffer, "reset") != NULL || strstr(priority_buffer, "RESET") != NULL) {
+                      Log_String("\r\n[SYSTEM] Commande RESET reçue ! Redémarrage du STM32...\r\n");
+                      osMutexRelease(GsmMutexHandle);
+                      osDelay(500); 
+                      NVIC_SystemReset(); 
+                  }
+                  
+                  osMessageQueuePut(MqttCommandQueueHandle, priority_buffer, 0, 0);
+              }
+              
+              p_idx = 0; 
+              memset(priority_buffer, 0, sizeof(priority_buffer));
+          }
+      }
+      osMutexRelease(GsmMutexHandle);
+  }
+
+  osDelay(5); 
+}
   /* USER CODE END StartTask04 */
 }
 
