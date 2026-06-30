@@ -446,6 +446,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         if (errorflags != RESET) {
             // Clear error flags by reading the data register
             __HAL_UART_FLUSH_DRREGISTER(huart);
+        } else {
+            // Write received byte to circular buffer
+            uint16_t next_head = (rx_head + 1) % RX_BUF_SIZE;
+            if (next_head != rx_tail) { // Sécurité anti-débordement
+                rx_ring_buf[rx_head] = rx_tmp_byte;
+                rx_head = next_head;
+            }
         }
         
         // Force-restart the interrupt reception so it doesn't stay dead
