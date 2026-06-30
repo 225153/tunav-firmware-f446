@@ -439,15 +439,16 @@ static void MX_GPIO_Init(void)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == UART4) {
-        // Calculer la prochaine position de la tête du tampon circulaire
-        uint16_t next_head = (rx_head + 1) % RX_BUF_SIZE;
+        // Read the SR and DR registers to clear ORE, NE, FE flags
+        uint32_t isrflags   = READ_REG(huart->Instance->SR);
+        uint32_t errorflags = (isrflags & (uint32_t)(USART_SR_PE | USART_SR_FE | USART_SR_NE | USART_SR_ORE));
         
-        if (next_head != rx_tail) { // Sécurité anti-débordement
-            rx_ring_buf[rx_head] = rx_tmp_byte;
-            rx_head = next_head;
+        if (errorflags != RESET) {
+            // Clear error flags by reading the data register
+            __HAL_UART_FLUSH_DRREGISTER(huart);
         }
         
-        // Relancer immédiatement l'interruption pour le prochain octet
+        // Force-restart the interrupt reception so it doesn't stay dead
         HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
     }
 }
