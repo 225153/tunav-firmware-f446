@@ -57,6 +57,8 @@
 /* External variables --------------------------------------------------------*/
 extern UART_HandleTypeDef huart4;
 extern TIM_HandleTypeDef htim1;
+extern UART_HandleTypeDef huart1;
+extern TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN EV */
 
@@ -189,5 +191,19 @@ void UART4_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+/**
+  * @brief This function handles USART1 global interrupt.
+  */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
 
+/**
+  * @brief This function handles TIM6 global interrupt and DAC1/2 underrun error interrupts.
+  */
+void TIM6_DAC_IRQHandler(void)
+{
+  HAL_TIM_IRQHandler(&htim6);
+}
 /* USER CODE END 1 */

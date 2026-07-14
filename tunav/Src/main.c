@@ -48,6 +48,8 @@
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart1; // Liaison Modbus RTU (VIGI 3000)
+TIM_HandleTypeDef htim6;   // Timer périodique pour déclenchement Modbus
 
 /* Definitions for TaskLed */
 osThreadId_t TaskLedHandle;
@@ -101,6 +103,32 @@ QueueHandle_t LogQueueHandle = NULL;
 #define SEUIL_BAS  6.3f
 char g_imei[16] = "000000000000000";       // Populated once via AT+GSN
 char g_last_at_response[512] = {0};        // Snapshot of the last EC200U_SendAT reply
+
+/* Trames de requêtes Modbus (Read Holding Registers - Fonction 0x03) */
+// Basé sur vos trames : ajustez l'ID esclave (0x01 par défaut) selon votre VIGI
+uint8_t Req_Voie1_7[8]  = {0x01, 0x03, 0x00, 0x8D, 0x00, 0x07, 0x54, 0x26}; // Registre 141 (0x008D) - 7 mots (Mesures)
+uint8_t Req_Alarmes[8]  = {0x01, 0x03, 0x00, 0x9E, 0x00, 0x03, 0x64, 0x25}; // Registre 158 (0x009E) - 3 mots (États)
+uint8_t Req_Config[8]   = {0x01, 0x03, 0x00, 0x0D, 0x00, 0x02, 0x55, 0xC8}; // Registre 13 (0x000D)  - 2 mots
+
+/* Buffers de réception et traitement Modbus */
+uint8_t RxBuffer[100];
+char str_mesures[100] = "";
+char str_alarmes[100] = "";
+char str_config[100]  = "";
+char completeResponse[800];
+
+/* Machine d'états pour l'enchaînement des requêtes Modbus */
+typedef enum {
+    MODBUS_IDLE,
+    ATTENTE_REPONSE_1,
+    ATTENTE_REPONSE_2,
+    ATTENTE_REPONSE_3,
+    CONSTRUCTION_TRAME
+} ModbusState_t;
+
+volatile ModbusState_t eModbusState = MODBUS_IDLE;
+volatile uint8_t flag_rx_complete = 0;
+volatile uint16_t rx_size = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -108,6 +136,10 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void); // Liaison Modbus RTU
+static void MX_TIM6_Init(void);        // Timer périodique de déclenchement Modbus
+void ProcessModbusResponse(uint8_t *data, uint16_t size, char *output_str);
+
 void StartDefaultTask(void *argument);
 void StartTask02(void *argument);
 void StartTask03(void *argument);
@@ -221,9 +253,25 @@ void Extract_IMEI(const char* resp, char* out, size_t out_size) {
     }
 }
 
-// Builds a *VIG&imei&Dddmmyyyyhhmmss&Sxxxxyyyy&Vxxxx...&status# frame.
-// NOTE: voies (channels) are simulated since no ADC/sensor acquisition is wired
-// up yet. Replace the random-walk block below once real sensor readings exist.
+// Convertit les octets de données utiles d'une trame Modbus en chaîne Hexadécimale
+void ProcessModbusResponse(uint8_t *data, uint16_t size, char *output_str) {
+    // Réponse standard : [ID][Fonction][Nb Octets] ... [Données] ... [CRC L][CRC H]
+    // On extrait uniquement les données utiles (nb_octets_utiles = data[2])
+    if (size > 5) {
+        uint8_t nb_octets_utiles = data[2];
+        char temp[5];
+        output_str[0] = '\0';
+        
+        for (uint8_t i = 0; i < nb_octets_utiles && (i + 3) < (size - 2); i++) {
+            sprintf(temp, "%02X", data[i + 3]);
+            strncat(output_str, temp, 99 - strlen(output_str));
+        }
+    }
+}
+
+// Builds a *VIG&imei&Dddmmyyyyhhmmss&Sxxxxyyyy&Vxxxx...&Fstatus# frame.
+// Fetches active Modbus register results read from VIGI 3000,
+// and falls back to standard placeholders if no Modbus cycle has happened yet.
 void Build_VigiFrame(char* out, size_t out_size) {
     // 1. Timestamp from the network clock (falls back to epoch if unavailable)
     char dateStr[15] = "01011970000000";
@@ -235,32 +283,26 @@ void Build_VigiFrame(char* out, size_t out_size) {
         }
     }
 
-    // 2. Simulated sensor channels (placeholder until real sensors are integrated)
-    static float voies[7] = {6.5f, 6.8f, 7.0f, 6.2f, 7.4f, 6.9f, 7.1f};
-    uint16_t depassements = 0, alarmes = 0, defauts = 0;
-    for (int i = 0; i < 7; i++) {
-        float step = ((float)((HAL_GetTick() + (uint32_t)i * 37) % 21) - 10.0f) / 10.0f; // -1.0 .. +1.0
-        voies[i] += step;
-        if (voies[i] < 0.0f) voies[i] = 0.0f;
-        if (voies[i] > 20.0f) voies[i] = 20.0f;
-        if (voies[i] > SEUIL_HAUT) { depassements |= (uint16_t)(1 << i); alarmes |= (uint16_t)(1 << i); }
-        if (voies[i] < SEUIL_BAS)  { depassements |= (uint16_t)(1 << (i + 8)); }
+    // 2. Fetch the actual Modbus register values or fallback if not ready
+    char config_str[32] = "006C003F"; // Safe placeholder (seuils haut & bas par défaut)
+    char mesures_str[64] = "004100440046003E004A00450047"; // Safe placeholder (7 voies par défaut)
+    char alarmes_str[32] = "000000000000"; // Safe placeholder (defauts, depassements, alarmes par défaut)
+    
+    if (strlen(str_config) > 0) {
+        strncpy(config_str, str_config, sizeof(config_str) - 1);
+        config_str[sizeof(config_str) - 1] = '\0';
+    }
+    if (strlen(str_mesures) > 0) {
+        strncpy(mesures_str, str_mesures, sizeof(mesures_str) - 1);
+        mesures_str[sizeof(mesures_str) - 1] = '\0';
+    }
+    if (strlen(str_alarmes) > 0) {
+        strncpy(alarmes_str, str_alarmes, sizeof(alarmes_str) - 1);
+        alarmes_str[sizeof(alarmes_str) - 1] = '\0';
     }
 
-    char voiesStr[29] = "";
-    for (int i = 0; i < 7; i++) {
-        char tmp[5];
-        snprintf(tmp, sizeof(tmp), "%04X", (unsigned)(voies[i] * 10.0f));
-        strncat(voiesStr, tmp, sizeof(voiesStr) - strlen(voiesStr) - 1);
-    }
-
-    char seuils[9];
-    snprintf(seuils, sizeof(seuils), "%04X%04X", (unsigned)(SEUIL_HAUT * 10), (unsigned)(SEUIL_BAS * 10));
-
-    char status[13];
-    snprintf(status, sizeof(status), "%04X%04X%04X", defauts, depassements, alarmes);
-
-    snprintf(out, out_size, "*VIG&%s&D%s&S%s&V%s&%s#", g_imei, dateStr, seuils, voiesStr, status);
+    // Send final assembled frame
+    snprintf(out, out_size, "*VIG&%s&D%s&S%s&V%s&F%s#", g_imei, dateStr, config_str, mesures_str, alarmes_str);
 }
 /* USER CODE END 0 */
 
@@ -295,9 +337,14 @@ int main(void)
   MX_GPIO_Init();
   MX_UART4_Init();
   MX_USART2_UART_Init();
+  MX_USART1_UART_Init(); // Initialize Modbus RTU interface
+  MX_TIM6_Init();        // Initialize periodic Modbus trigger timer
   /* USER CODE BEGIN 2 */
    HAL_UART_Transmit(&huart2, (uint8_t*)"System Ready. Booting RTOS...\r\n", 31, 100);
    HAL_UART_Receive_IT(&huart4, &rx_tmp_byte, 1);
+   
+   // Start Modbus periodic trigger timer
+   HAL_TIM_Base_Start_IT(&htim6);
   
   // Create Message Queue for 10 entries of 128 bytes length strings
   LogQueueHandle = xQueueCreate(10, 128);
@@ -476,6 +523,49 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function (Modbus RTU VIGI 3000)
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600; // Modbus standard
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM6 Initialization Function (Periodic Modbus Master trigger)
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+  htim6.Instance = TIM6;
+  // Let's set timer interrupt to fire every 10 seconds.
+  // HSE/HSI internal clock might be 16MHz or 180MHz (depending on clock tree).
+  // Prescaler = 16000-1 gives 1 ms ticks at 16MHz.
+  // Period = 10000-1 gives 10 seconds.
+  htim6.Init.Prescaler = 16000 - 1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 10000 - 1;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -532,6 +622,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
+// Callback for detecting end of Modbus frames via UART Idle Line Detection
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart->Instance == USART1) {
+        rx_size = Size;
+        flag_rx_complete = 1;
+        char temp_log[64];
+        snprintf(temp_log, sizeof(temp_log), "[MODBUS] Data received on USART1 (Size: %d)\r\n", Size);
+        Log_String(temp_log);
+    }
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -544,11 +645,76 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
+  static uint32_t led_tick = 0;
+  
   /* Infinite loop */
   for(;;)
   {
-    HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
-    osDelay(500);
+    // Toggle PC13 Debug LED every 10 cycles (50ms * 10 = 500ms) to preserve the original 500ms blink rate
+    if (led_tick++ >= 10) {
+        led_tick = 0;
+        HAL_GPIO_TogglePin(Debug_Led_GPIO_Port, Debug_Led_Pin);
+    }
+    
+    // Non-blocking processing of the Modbus State Machine
+    switch (eModbusState) {
+        
+        case ATTENTE_REPONSE_1:
+            if (flag_rx_complete) {
+                flag_rx_complete = 0;
+                ProcessModbusResponse(RxBuffer, rx_size, str_config);
+                Log_String("[MODBUS] Config (seuils) reçue !\r\n");
+                
+                // Envoyer la requête 2 : Voie 1 à 7
+                memset(RxBuffer, 0, sizeof(RxBuffer));
+                HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxBuffer, sizeof(RxBuffer));
+                HAL_UART_Transmit(&huart1, Req_Voie1_7, sizeof(Req_Voie1_7), 200);
+                eModbusState = ATTENTE_REPONSE_2;
+            }
+            break;
+
+        case ATTENTE_REPONSE_2:
+            if (flag_rx_complete) {
+                flag_rx_complete = 0;
+                ProcessModbusResponse(RxBuffer, rx_size, str_mesures);
+                Log_String("[MODBUS] Mesures (voies 1-7) reçues !\r\n");
+                
+                // Envoyer la requête 3 : Alarmes
+                memset(RxBuffer, 0, sizeof(RxBuffer));
+                HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxBuffer, sizeof(RxBuffer));
+                HAL_UART_Transmit(&huart1, Req_Alarmes, sizeof(Req_Alarmes), 200);
+                eModbusState = ATTENTE_REPONSE_3;
+            }
+            break;
+
+        case ATTENTE_REPONSE_3:
+            if (flag_rx_complete) {
+                flag_rx_complete = 0;
+                ProcessModbusResponse(RxBuffer, rx_size, str_alarmes);
+                Log_String("[MODBUS] Alarmes/Défauts reçus !\r\n");
+                eModbusState = CONSTRUCTION_TRAME;
+            }
+            break;
+
+        case CONSTRUCTION_TRAME:
+            // Assemblage de la trame au format *VIG
+            snprintf(completeResponse, sizeof(completeResponse), 
+                     "*VIG&%s&D05112021170030&S%s&V%s&F%s#\r\n", 
+                     g_imei, str_config, str_mesures, str_alarmes);
+            
+            // Log local de la trame
+            Log_String("[MODBUS] Nouvelle trame VIGI générée : ");
+            Log_String(completeResponse);
+            
+            eModbusState = MODBUS_IDLE;
+            break;
+            
+        case MODBUS_IDLE:
+        default:
+            break;
+    }
+
+    osDelay(50); // Petit délai non bloquant pour le planificateur RTOS
   }
   /* USER CODE END 5 */
 }
@@ -769,6 +935,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM1)
   {
     HAL_IncTick();
+  }
+  else if (htim->Instance == TIM6)
+  {
+    // Start Modbus read cycle if previous is finished (IDLE)
+    if (eModbusState == MODBUS_IDLE) {
+        memset(RxBuffer, 0, sizeof(RxBuffer));
+        // Arm RX event interrupt
+        HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxBuffer, sizeof(RxBuffer));
+        // Send request 1: configuration
+        HAL_UART_Transmit(&huart1, Req_Config, sizeof(Req_Config), 200);
+        
+        eModbusState = ATTENTE_REPONSE_1;
+    }
   }
   /* USER CODE BEGIN Callback 1 */
 
