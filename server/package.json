@@ -1,0 +1,17 @@
+{
+  "name": "tunav-server",
+  "version": "1.0.0",
+  "description": "MQTT bridge (EC200U -> EMQX) that decodes VIGI frames and stores them in Supabase, plus a REST API for the frontend.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "simulate": "node simulator.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.1"
+  }
+}
