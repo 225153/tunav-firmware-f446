@@ -58,15 +58,86 @@ Les dossiers [tunav/Drivers](tunav/Drivers) et [tunav/Middlewares](tunav/Middlew
 Au démarrage, [tunav/Src/main.c](tunav/Src/main.c) exécute la séquence suivante :
 
 1. `HAL_Init()` initialise le HAL.
-2. `SystemClock_Config()` configure l'horloge système en utilisant l'oscillateur interne HSI à 16 MHz.
-3. Les GPIO, UART4 et USART2 sont initialisés.
-4. L'UART4 démarre en réception interrompue afin d'alimenter un tampon circulaire.
-5. Une file de logs et une mutex GSM sont créées.
-6. Le noyau FreeRTOS est lancé et les tâches applicatives démarrent.
+- Séquence de boot : `HAL_Init()`, `SystemClock_Config()`, `MX_GPIO_Init()`, `MX_UART4_Init()` et `MX_USART2_UART_Init()`.
+- L'UART4 démarre en réception interrompue pour alimenter le tampon circulaire.
+- Les files FreeRTOS et la mutex GSM sont créées.
+- Le noyau FreeRTOS est lancé, activant les tâches d'application.
 
-### Base de temps HAL
+## Architecture du Serveur (Node.js Bridge)
 
-Le fichier [tunav/Src/stm32f4xx_hal_timebase_tim.c](tunav/Src/stm32f4xx_hal_timebase_tim.c) remplace la base de temps classique par **TIM1**. Cela permet de conserver une tick de 1 ms compatible avec l'application tout en évitant les conflits classiques entre le SysTick HAL et FreeRTOS.
+Le projet intègre un serveur local dans le dossier [server/](server/) qui fait le pont entre le broker EMQX MQTT et la base de données **Supabase** :
+
+```mermaid
+graph LR
+    STM32[STM32 + EC200U main.c] -- "1. Publie trames *VIG...# en MQTTS (Port 8883)" --> EMQX[EMQX Cloud Broker]
+    EMQX -- "2. Route le message" --> Server[server.js Node.js Bridge]
+    Server -- "3. Décode la trame VIGI & insère" --> Supabase[(Base Supabase mesures)]
+```
+
+### Format des Trames de Mesures VIGI
+Le firmware et le serveur d'intégration utilisent le protocole d'échange de trames suivant :
+`*VIG&<imei>&D<ddMMyyyyhhmmss>&S<seuil_haut><seuil_bas>&V<voie1><voie2>...<voie7>&<status>#`
+
+- **Date (`D...`)** : date et heure réseau au format ISO.
+- **Seuils (`S...`)** : valeurs haut et bas encodées en hexadécimal 16 bits (multipliées par 10). Ex: `006C` correspond à `108` soit `10.8`.
+- **Voies (7 canaux, `V...`)** : chaque voie fait 4 caractères hexadécimaux representant la valeur multipliée par 10.
+- **Status** : concaténation de trois valeurs héxadécimales de 4 caractères : `DÉFAUTS`, `DÉPASSEMENTS`, `ALARMES` du système.
+
+---
+
+## Installation et Lancement Rapide (Étape par Étape)
+
+### 1. Préparation de la Base de Données (Supabase)
+Avant de lancer le serveur, vous devez avoir une table dans Supabase nommée `mesures` avec les colonnes suivantes :
+- `id` (int8, Primary Key, autoincrement)
+- `imei` (varchar)
+- `timestamp` (timestamptz)
+- `seuil_haut` (float4)
+- `seuil_bas` (float4)
+- `voie1`, `voie2`, `voie3`, `voie4`, `voie5`, `voie6`, `voie7` (float4 chacune)
+- `defauts` (int4)
+- `depassements` (int4)
+- `alarmes` (int4)
+
+### 2. Configuration et Lancement du Serveur de Décodage
+
+1. Naviguez dans le dossier server :
+   ```bash
+   cd server
+   ```
+2. Installez les dépendances :
+   ```bash
+   npm install
+   ```
+3. Créez votre fichier d'environnement `.env` :
+   Dupliquez le fichier `.env.example` et nommez-le `.env` :
+   ```bash
+   cp .env.example .env
+   ```
+4. Ouvrez le fichier `.env` nouvellement créé et configurez vos accès Supabase :
+   ```env
+   SUPABASE_URL=https://votre-id-projet.supabase.co
+   SUPABASE_KEY=votre-cle-api-supabase
+   ```
+5. Lancez le serveur Node.js principal de production :
+   ```bash
+   npm start
+   ```
+
+Le terminal affichera que le serveur est en ligne, connecté au broker EMQX, et qu'il écoute le topic `tunav/telemetry` en attente de décoder des trames.
+
+### 3. Simulation de Données (Optionnel, sans carte STM32)
+Si vous voulez tester l'intégration et l'insertion en base Supabase (pour votre interface frontend Angular par exemple) sans allumer le STM32, vous pouvez lancer le simulateur indépendant :
+```bash
+npm run simulate
+```
+
+### 4. Téléversement et Déboguage du Firmware STM32
+1. Compilez et chargez le code sur votre cible STM32F446RE via PlatformIO dans VS Code.
+2. Assurez-vous d'appuyer sur le bouton **RESET** physique de votre carte après chaque téléversement.
+3. Le STM32 va récupérer son IMEI via `AT+GSN`, l'heure réseau via `AT+CCLK?`, formater ses mesures simulées et les publier sur le topic. Le serveur capte et insère le tout en temps réel dans votre base.
+
+---
 
 ## Tâches FreeRTOS
 

@@ -95,6 +95,12 @@ volatile uint16_t rx_tail = 0;
 uint8_t rx_tmp_byte; // Octet temporaire pour l'interruption
 
 QueueHandle_t LogQueueHandle = NULL;
+
+// --- VIGI frame support ---
+#define SEUIL_HAUT 10.8f
+#define SEUIL_BAS  6.3f
+char g_imei[16] = "000000000000000";       // Populated once via AT+GSN
+char g_last_at_response[512] = {0};        // Snapshot of the last EC200U_SendAT reply
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -185,10 +191,76 @@ uint8_t EC200U_SendAT(char* cmd, uint32_t timeout_ms) {
         Log_String("[ERROR] No response from EC200U\r\n");
     }
     
+    // Snapshot the raw reply so callers can parse it (e.g. AT+GSN, AT+CCLK?)
+    strncpy(g_last_at_response, buffer, sizeof(g_last_at_response) - 1);
+    g_last_at_response[sizeof(g_last_at_response) - 1] = '\0';
+    
     // 2. TRAP PROTECTION: Release the Mutex so other tasks can use the GSM
     osMutexRelease(GsmMutexHandle);
     
     return status;
+}
+
+// Extracts the first run of 14+ digits found in an AT response (used for AT+GSN / IMEI)
+void Extract_IMEI(const char* resp, char* out, size_t out_size) {
+    const char* p = resp;
+    while (*p) {
+        if (*p >= '0' && *p <= '9') {
+            const char* start = p;
+            int len = 0;
+            while (*p >= '0' && *p <= '9') { p++; len++; }
+            if (len >= 14) {
+                int copy_len = (len < (int)(out_size - 1)) ? len : (int)(out_size - 1);
+                strncpy(out, start, copy_len);
+                out[copy_len] = '\0';
+                return;
+            }
+        } else {
+            p++;
+        }
+    }
+}
+
+// Builds a *VIG&imei&Dddmmyyyyhhmmss&Sxxxxyyyy&Vxxxx...&status# frame.
+// NOTE: voies (channels) are simulated since no ADC/sensor acquisition is wired
+// up yet. Replace the random-walk block below once real sensor readings exist.
+void Build_VigiFrame(char* out, size_t out_size) {
+    // 1. Timestamp from the network clock (falls back to epoch if unavailable)
+    char dateStr[15] = "01011970000000";
+    if (EC200U_SendAT("AT+CCLK?\r\n", 1000)) {
+        char* p = strstr(g_last_at_response, "+CCLK:");
+        int yy, MM, dd, hh, mm, ss;
+        if (p != NULL && sscanf(p, "+CCLK: \"%d/%d/%d,%d:%d:%d", &yy, &MM, &dd, &hh, &mm, &ss) == 6) {
+            snprintf(dateStr, sizeof(dateStr), "%02d%02d%04d%02d%02d%02d", dd, MM, 2000 + yy, hh, mm, ss);
+        }
+    }
+
+    // 2. Simulated sensor channels (placeholder until real sensors are integrated)
+    static float voies[7] = {6.5f, 6.8f, 7.0f, 6.2f, 7.4f, 6.9f, 7.1f};
+    uint16_t depassements = 0, alarmes = 0, defauts = 0;
+    for (int i = 0; i < 7; i++) {
+        float step = ((float)((HAL_GetTick() + (uint32_t)i * 37) % 21) - 10.0f) / 10.0f; // -1.0 .. +1.0
+        voies[i] += step;
+        if (voies[i] < 0.0f) voies[i] = 0.0f;
+        if (voies[i] > 20.0f) voies[i] = 20.0f;
+        if (voies[i] > SEUIL_HAUT) { depassements |= (uint16_t)(1 << i); alarmes |= (uint16_t)(1 << i); }
+        if (voies[i] < SEUIL_BAS)  { depassements |= (uint16_t)(1 << (i + 8)); }
+    }
+
+    char voiesStr[29] = "";
+    for (int i = 0; i < 7; i++) {
+        char tmp[5];
+        snprintf(tmp, sizeof(tmp), "%04X", (unsigned)(voies[i] * 10.0f));
+        strncat(voiesStr, tmp, sizeof(voiesStr) - strlen(voiesStr) - 1);
+    }
+
+    char seuils[9];
+    snprintf(seuils, sizeof(seuils), "%04X%04X", (unsigned)(SEUIL_HAUT * 10), (unsigned)(SEUIL_BAS * 10));
+
+    char status[13];
+    snprintf(status, sizeof(status), "%04X%04X%04X", defauts, depassements, alarmes);
+
+    snprintf(out, out_size, "*VIG&%s&D%s&S%s&V%s&%s#", g_imei, dateStr, seuils, voiesStr, status);
 }
 /* USER CODE END 0 */
 
@@ -492,8 +564,8 @@ void StartTask02(void *argument)
 {
   /* USER CODE BEGIN StartTask02 */
   char payload_cmd[256];
-unsigned long msg_counter = 0; 
 uint8_t link_is_up = 0;
+static uint8_t imei_fetched = 0;
 
 /* Infinite loop */
 for(;;)
@@ -505,6 +577,13 @@ for(;;)
       EC200U_SendAT("AT+CPIN?\r\n", 500);
       EC200U_SendAT("AT+QICSGP=1,1,\"internet.tn\",\"\",\"\",0\r\n", 1000);
       EC200U_SendAT("AT+QIACT=1\r\n", 4000);
+      
+      if (!imei_fetched) {
+          if (EC200U_SendAT("AT+GSN\r\n", 1000)) {
+              Extract_IMEI(g_last_at_response, g_imei, sizeof(g_imei));
+              imei_fetched = 1;
+          }
+      }
       
       Log_String("\r\n--- [MQTT] Configuring Secure TLS Context for EMQX... ---\r\n");
       EC200U_SendAT("AT+QMTCLOSE=0\r\n", 1000);
@@ -541,14 +620,14 @@ for(;;)
       }
   }
 
-  // Link is active: Formulate and stream payload
+  // Link is active: build a real *VIG frame and publish it
+  char vigi_frame[160];
+  Build_VigiFrame(vigi_frame, sizeof(vigi_frame));
   snprintf(payload_cmd, sizeof(payload_cmd), 
-           "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"Hello from RTOS Thread! Msg #%lu\"\r\n", 
-           msg_counter);
+           "AT+QMTPUB=0,0,0,0,\"tunav/telemetry\",\"%s\"\r\n", 
+           vigi_frame);
                
-  if (EC200U_SendAT(payload_cmd, 3000)) {
-      msg_counter++; 
-  } else {
+  if (!EC200U_SendAT(payload_cmd, 3000)) {
       Log_String("\r\n--- [WARN] Publish failed. Resetting session link... ---\r\n");
       link_is_up = 0; 
   }
