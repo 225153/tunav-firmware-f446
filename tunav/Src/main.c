@@ -153,6 +153,7 @@ void StartTask04(void *argument);
 /* USER CODE BEGIN 0 */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 void Log_String(const char* str) {
     char msg_buffer[128]; 
@@ -283,19 +284,32 @@ void Build_VigiFrame(char* out, size_t out_size) {
         }
     }
 
-    // 2. Fetch the actual Modbus register values or fallback if not ready
-    char config_str[32] = "006C003F"; // Safe placeholder (seuils haut & bas par défaut)
-    char mesures_str[64] = "004100440046003E004A00450047"; // Safe placeholder (7 voies par défaut)
-    char alarmes_str[32] = "000000000000"; // Safe placeholder (defauts, depassements, alarmes par défaut)
+    // 2. Fetch the actual Modbus register values or fallback with random values if not ready
+    char config_str[32] = "006C003F"; // Safe placeholder
+    char mesures_str[64] = ""; 
+    char alarmes_str[32] = "000000000000"; 
     
     if (strlen(str_config) > 0) {
         strncpy(config_str, str_config, sizeof(config_str) - 1);
         config_str[sizeof(config_str) - 1] = '\0';
     }
+    
     if (strlen(str_mesures) > 0) {
         strncpy(mesures_str, str_mesures, sizeof(mesures_str) - 1);
         mesures_str[sizeof(mesures_str) - 1] = '\0';
+    } else {
+        // Generate 7 random values (16-bit hex) to simulate sensors
+        // Using HAL_GetTick for a simple pseudo-random seed
+        srand(HAL_GetTick());
+        for (int i = 0; i < 7; i++) {
+            // Generate a value between 0x0030 and 0x0060 (simulating realistic data)
+            int val = (rand() % 48) + 48; 
+            char hex[5];
+            snprintf(hex, sizeof(hex), "%04X", val);
+            strcat(mesures_str, hex);
+        }
     }
+
     if (strlen(str_alarmes) > 0) {
         strncpy(alarmes_str, str_alarmes, sizeof(alarmes_str) - 1);
         alarmes_str[sizeof(alarmes_str) - 1] = '\0';
